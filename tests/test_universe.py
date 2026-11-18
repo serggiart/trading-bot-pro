@@ -87,8 +87,8 @@ def _make_fmp_http_get(
         if "cash-flow-statement" in url:
             return _make_http_response([{"freeCashFlow": fcf}])
         if "ratios" in url:
-            return _make_http_response([{"debtEquityRatio": debt_to_equity}])
-        if "earning_calendar" in url:
+            return _make_http_response([{"debtToEquityRatio": debt_to_equity}])
+        if "earnings" in url or "earning_calendar" in url:
             return _make_http_response([{"date": d} for d in dates])
         raise AssertionError(f"Unexpected FMP URL: {url}")
 

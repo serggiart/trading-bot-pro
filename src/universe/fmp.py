@@ -68,7 +68,7 @@ def _parse_debt_to_equity(payload: Any, symbol: str) -> float:
     record = _extract_first_record(payload)
     if record is None:
         raise FmpApiError(f"Empty ratios payload returned by FMP for {symbol}")
-    for key in ("debtEquityRatio", "debtToEquity", "debt_to_equity"):
+    for key in ("debtToEquityRatio", "debtEquityRatio", "debtToEquity", "debt_to_equity"):
         val = record.get(key)
         if val is not None:
             return float(val)
@@ -114,7 +114,7 @@ class FmpClient:
         daily_limit: int = DEFAULT_FMP_DAILY_LIMIT,
         cache_ttl_hours: float = 24.0,
         timeout: float = 10.0,
-        base_url: str = "https://financialmodelingprep.com/api/v3",
+        base_url: str = "https://financialmodelingprep.com/stable",
     ) -> None:
         self.store = store
         self._api_key = api_key
@@ -172,27 +172,51 @@ class FmpClient:
                 from_cache=True,
             )
 
-        cashflow_payload = self._fetch_endpoint(
-            endpoint_path=f"cash-flow-statement/{norm_symbol}",
-            endpoint_name="cash-flow-statement",
-            symbol=norm_symbol,
-            params={"limit": 1},
-            now=now,
-        )
-        ratios_payload = self._fetch_endpoint(
-            endpoint_path=f"ratios/{norm_symbol}",
-            endpoint_name="ratios",
-            symbol=norm_symbol,
-            params={"limit": 1},
-            now=now,
-        )
-        earnings_payload = self._fetch_endpoint(
-            endpoint_path=f"historical/earning_calendar/{norm_symbol}",
-            endpoint_name="earning_calendar",
-            symbol=norm_symbol,
-            params={"limit": 4},
-            now=now,
-        )
+        is_legacy_v3 = "/api/v3" in self.base_url
+        if is_legacy_v3:
+            cashflow_payload = self._fetch_endpoint(
+                endpoint_path=f"cash-flow-statement/{norm_symbol}",
+                endpoint_name="cash-flow-statement",
+                symbol=norm_symbol,
+                params={"limit": 1},
+                now=now,
+            )
+            ratios_payload = self._fetch_endpoint(
+                endpoint_path=f"ratios/{norm_symbol}",
+                endpoint_name="ratios",
+                symbol=norm_symbol,
+                params={"limit": 1},
+                now=now,
+            )
+            earnings_payload = self._fetch_endpoint(
+                endpoint_path=f"historical/earning_calendar/{norm_symbol}",
+                endpoint_name="earning_calendar",
+                symbol=norm_symbol,
+                params={"limit": 4},
+                now=now,
+            )
+        else:
+            cashflow_payload = self._fetch_endpoint(
+                endpoint_path="cash-flow-statement",
+                endpoint_name="cash-flow-statement",
+                symbol=norm_symbol,
+                params={"symbol": norm_symbol, "limit": 1},
+                now=now,
+            )
+            ratios_payload = self._fetch_endpoint(
+                endpoint_path="ratios",
+                endpoint_name="ratios",
+                symbol=norm_symbol,
+                params={"symbol": norm_symbol, "limit": 1},
+                now=now,
+            )
+            earnings_payload = self._fetch_endpoint(
+                endpoint_path="earnings",
+                endpoint_name="earnings",
+                symbol=norm_symbol,
+                params={"symbol": norm_symbol},
+                now=now,
+            )
 
         free_cash_flow = _parse_free_cash_flow(cashflow_payload, norm_symbol)
         debt_to_equity = _parse_debt_to_equity(ratios_payload, norm_symbol)
