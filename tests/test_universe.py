@@ -30,6 +30,7 @@ from src.universe import (
     calculate_ema,
     calculate_rsi,
     calculate_sma,
+    compute_return_correlation_matrix,
     select_top_candidates,
     validate_cross_price,
 )
@@ -622,3 +623,24 @@ def test_select_top_candidates_filters_and_ranks_deterministically() -> None:
     selected = select_top_candidates(candidates, max_candidates=2)
     assert [c.symbol for c in selected] == ["TOP1", "TOP2"]
     assert select_top_candidates(candidates, max_candidates=0) == []
+
+
+def test_compute_return_correlation_matrix_and_zero_std_safety() -> None:
+    dates = pd.date_range("2026-01-01", periods=40, freq="B")
+    rng = np.random.default_rng(7)
+    base_rets = rng.normal(0.001, 0.015, size=40)
+    prices_a = 100.0 * np.cumprod(1.0 + base_rets)
+    prices_b = 150.0 * np.cumprod(1.0 + base_rets * 0.95 + rng.normal(0.0, 0.001, size=40))
+    prices_c = 80.0 * np.cumprod(1.0 - base_rets)
+    flat_prices = np.full(40, 50.0)
+
+    histories = {
+        "AAPL": pd.DataFrame({"Close": prices_a}, index=dates),
+        "MSFT": pd.DataFrame({"Close": prices_b}, index=dates),
+        "SH": pd.DataFrame({"Close": prices_c}, index=dates),
+        "FLAT": pd.DataFrame({"Close": flat_prices}, index=dates),
+    }
+    matrix = compute_return_correlation_matrix(histories, lookback_days=35, min_periods=20)
+    assert matrix[("AAPL", "MSFT")] > 0.90
+    assert matrix[("AAPL", "SH")] < -0.90
+    assert ("AAPL", "FLAT") not in matrix

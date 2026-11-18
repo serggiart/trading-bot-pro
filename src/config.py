@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
+NY_TIMEZONE = ZoneInfo("America/New_York")
 DEFAULT_STRATEGY_CONFIG_PATH = Path("config/strategy.local.json")
+DEFAULT_FED_CALENDAR_PATH = Path("config/fed_calendar.json")
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,3 +137,42 @@ def load_strategy_settings(
         or defaults.default_sector,
         sector_map=_parse_sector_map(raw_data.get("sector_map")),
     )
+
+
+def load_fed_dates(calendar_path: str | Path | None = None) -> list[datetime]:
+    """Load scheduled FOMC decision timestamps normalized to America/New_York."""
+    if calendar_path is not None:
+        resolved = Path(calendar_path)
+        explicit = True
+    else:
+        env_path = os.getenv("FED_CALENDAR_PATH", "").strip()
+        resolved = Path(env_path) if env_path else DEFAULT_FED_CALENDAR_PATH
+        explicit = bool(env_path)
+
+    if not resolved.exists():
+        if explicit:
+            raise FileNotFoundError(f"Fed calendar file not found: {resolved}")
+        return []
+
+    raw_data = json.loads(resolved.read_text(encoding="utf-8"))
+    if not isinstance(raw_data, dict):
+        raise ValueError(f"Fed calendar must be a JSON object: {resolved}")
+
+    raw_dates = raw_data.get("fomc_decisions", [])
+    if not isinstance(raw_dates, list):
+        raise ValueError("fomc_decisions must be a list of ISO timestamps")
+
+    parsed: list[datetime] = []
+    for item in raw_dates:
+        text = str(item).strip()
+        if not text:
+            continue
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=NY_TIMEZONE)
+        else:
+            dt = dt.astimezone(NY_TIMEZONE)
+        parsed.append(dt)
+    return parsed

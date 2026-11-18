@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from src.analyst import AnalystConfig, AnalystEvaluationResult, GeminiAnalyst, NewsAggregator, NewsItem
-from src.config import StrategySettings, load_strategy_settings
+from src.config import StrategySettings, load_fed_dates, load_strategy_settings
 from src.guardian import (
     GuardianDecision,
     MarketContext,
@@ -32,6 +32,7 @@ from src.universe import (
     MarketDataClient,
     UniverseScreener,
     UniverseScreeningResult,
+    compute_return_correlation_matrix,
     select_top_candidates,
 )
 
@@ -243,6 +244,8 @@ class TradingBotOrchestrator:
         sector_map: Mapping[str, str] | None = None,
         take_profit_atr_multiplier: float = 2.0,
         max_candidates_for_ai: int = 5,
+        default_fed_dates: Sequence[datetime] = (),
+        candle_store: Any | None = None,
     ) -> None:
         self.audit_store = audit_store or TradingAuditStore()
         self.guardian = guardian or RiskGuardian()
@@ -253,6 +256,7 @@ class TradingBotOrchestrator:
         self._analyst = analyst
         self._execution_client = execution_client
         self._position_manager = position_manager
+        self._candle_store = candle_store
 
         self.confirmation_delay_minutes = float(confirmation_delay_minutes)
         self.max_confirmation_delay_minutes = float(max_confirmation_delay_minutes)
@@ -262,6 +266,7 @@ class TradingBotOrchestrator:
         }
         self.take_profit_atr_multiplier = float(take_profit_atr_multiplier)
         self.max_candidates_for_ai = int(max_candidates_for_ai)
+        self.default_fed_dates: tuple[datetime, ...] = tuple(default_fed_dates)
 
     @property
     def screener(self) -> UniverseScreener:
@@ -676,6 +681,41 @@ class TradingBotOrchestrator:
 
         return resolved_equity, resolved_pnl, resolved_positions
 
+    def _resolve_correlation_matrix(
+        self,
+        candidate_symbols: Sequence[str],
+        portfolio_positions: Sequence[PortfolioPosition],
+    ) -> dict[tuple[str, str], float]:
+        """Compute pairwise return correlations from local cached candles if holdings exist."""
+        if not portfolio_positions or not candidate_symbols:
+            return {}
+
+        store = self._candle_store
+        if store is None:
+            try:
+                from src.backtest import ParquetCandleStore
+
+                store = ParquetCandleStore()
+            except Exception:
+                return {}
+
+        all_symbols = sorted(
+            {s.strip().upper() for s in candidate_symbols if s.strip()}
+            | {p.symbol.strip().upper() for p in portfolio_positions if p.symbol.strip()}
+        )
+        histories: dict[str, Any] = {}
+        for sym in all_symbols:
+            try:
+                df = store.load_candles(sym)
+                if df is not None and not df.empty:
+                    histories[sym] = df
+            except Exception as exc:
+                logger.debug("Skipping correlation history for %s: %s", sym, exc)
+
+        if len(histories) < 2:
+            return {}
+        return compute_return_correlation_matrix(histories)
+
     def run_cycle(
         self,
         symbols: Sequence[str],
@@ -743,11 +783,14 @@ class TradingBotOrchestrator:
         normalized_avg_vols = {
             k.strip().upper(): float(v) for k, v in (avg_volumes_20d or {}).items()
         }
-        resolved_corr: Mapping[tuple[str, str], float] | Mapping[str, float] = (
-            correlation_matrix if correlation_matrix is not None else {}
-        )
-
         cleaned_symbols = [raw.strip().upper() for raw in symbols if raw.strip()]
+        resolved_corr: Mapping[tuple[str, str], float] | Mapping[str, float] = (
+            correlation_matrix
+            if correlation_matrix is not None
+            else self._resolve_correlation_matrix(cleaned_symbols, portfolio_positions)
+        )
+        resolved_fed_dates = fed_dates if fed_dates else self.default_fed_dates
+
         shared_vix: float | None = None
         if cleaned_symbols and type(self.screener) is UniverseScreener:
             shared_vix = self.screener.market_data.get_vix()
@@ -833,7 +876,7 @@ class TradingBotOrchestrator:
                     correlation_matrix=resolved_corr,
                     starting_equity=starting_equity,
                     daily_pnl=daily_pnl,
-                    fed_dates=fed_dates,
+                    fed_dates=resolved_fed_dates,
                     current_prices=normalized_prices,
                     current_volumes=normalized_cur_vols,
                     avg_volumes_20d=normalized_avg_vols,
@@ -1040,6 +1083,7 @@ def _build_orchestrator_from_settings(
         sector_map=settings.sector_map,
         take_profit_atr_multiplier=settings.atr_take_profit_multiplier,
         max_candidates_for_ai=max_candidates,
+        default_fed_dates=load_fed_dates(),
     )
 
 

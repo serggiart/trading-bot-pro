@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -176,6 +176,54 @@ def calculate_avg_volume(
         return 0.0
     sample = window[-period:] if len(window) >= period else window
     return float(np.mean(sample))
+
+
+def compute_return_correlation_matrix(
+    price_histories: Mapping[str, pd.DataFrame],
+    lookback_days: int = 60,
+    min_periods: int = 20,
+) -> dict[tuple[str, str], float]:
+    """Compute pairwise Pearson return correlations across symbols over trailing sessions."""
+    if lookback_days <= 1:
+        raise ValueError("lookback_days must be > 1")
+    if min_periods <= 1:
+        raise ValueError("min_periods must be > 1")
+
+    close_series: dict[str, pd.Series] = {}
+    for raw_symbol, df in price_histories.items():
+        symbol = raw_symbol.strip().upper()
+        if not symbol or df is None or df.empty:
+            continue
+        try:
+            closes = _extract_column(df, "Close")
+        except KeyError:
+            continue
+        if len(closes) < min_periods + 1:
+            continue
+        idx = pd.to_datetime(closes.index)
+        if idx.tz is not None:
+            idx = idx.tz_convert("America/New_York").tz_localize(None)
+        normalized = pd.Series(closes.to_numpy(dtype=np.float64), index=idx.normalize())
+        normalized = normalized[~normalized.index.duplicated(keep="last")].sort_index()
+        close_series[symbol] = normalized
+
+    if len(close_series) < 2:
+        return {}
+
+    aligned = pd.DataFrame(close_series).sort_index()
+    returns = aligned.pct_change().dropna(how="all")
+    if lookback_days > 0 and len(returns) > lookback_days:
+        returns = returns.iloc[-lookback_days:]
+
+    corr_df = returns.corr(min_periods=min_periods)
+    matrix: dict[tuple[str, str], float] = {}
+    symbols = sorted(corr_df.columns)
+    for i, sym_a in enumerate(symbols):
+        for sym_b in symbols[i + 1 :]:
+            val = float(corr_df.loc[sym_a, sym_b])
+            if math.isfinite(val):
+                matrix[(sym_a, sym_b)] = max(-1.0, min(1.0, val))
+    return matrix
 
 
 def validate_cross_price(

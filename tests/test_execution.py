@@ -666,3 +666,77 @@ def test_crash_safe_position_reconciliation_from_broker_and_sqlite(tmp_path: Pat
     # Stale closed symbol was purged from SQLite position_state
     assert store.get_position_state("STALE") is None
     assert store.get_position_state("MSFT") is not None
+
+
+def test_submit_limit_buy_fill_gated_state_and_sell_cancels_bracket_legs(
+    tmp_path: Path,
+) -> None:
+    store = TradingAuditStore(tmp_path / "bracket_legs.db")
+    mock_broker = MagicMock()
+
+    # 1) Unfilled accepted buy must NOT write position_state prematurely
+    mock_broker.submit_order.return_value = SimpleNamespace(
+        id="broker-buy-accepted",
+        status="accepted",
+        legs=[],
+    )
+    client = AlpacaExecutionClient(audit_store=store, trading_client=mock_broker)
+    unfilled_res = client.submit_limit_buy(
+        symbol="AAPL",
+        qty=10,
+        ask_price=200.0,
+        stop_loss_price=194.0,
+        take_profit_price=208.0,
+        metadata={"atr_14": 3.0},
+    )
+    assert unfilled_res.status == "accepted"
+    assert store.get_position_state("AAPL") is None
+
+    # Once Alpaca later fills it, reconcile_managed_positions recovers atr_14 & stop from orders
+    mock_broker.get_all_positions.return_value = [
+        SimpleNamespace(symbol="AAPL", qty="10", avg_entry_price="200.10"),
+    ]
+    mock_broker.get_orders.return_value = [
+        SimpleNamespace(id="leg-stop-1", symbol="AAPL", side="sell", order_type="stop", stop_price="194.00"),
+        SimpleNamespace(id="leg-tp-1", symbol="AAPL", side="sell", order_type="limit", limit_price="208.00"),
+        SimpleNamespace(id="other-sym-1", symbol="NVDA", side="sell", order_type="stop", stop_price="140.00"),
+    ]
+    reconciled = client.reconcile_managed_positions()
+    assert len(reconciled) == 1
+    assert reconciled[0].atr_14 == pytest.approx(3.0)
+    assert reconciled[0].current_stop_price == pytest.approx(194.0)
+    assert reconciled[0].stop_order_id == "leg-stop-1"
+    assert store.get_orders(symbol="AAPL")[0].status == "filled"
+
+    # 2) Filled buy immediately records position_state with child stop leg ID
+    mock_broker.submit_order.return_value = SimpleNamespace(
+        id="broker-buy-filled",
+        status="filled",
+        legs=[SimpleNamespace(id="child-stop-99", order_type="stop")],
+    )
+    client.submit_limit_buy(
+        symbol="MSFT",
+        qty=5,
+        ask_price=400.0,
+        stop_loss_price=390.0,
+        metadata={"atr_14": 5.0},
+    )
+    msft_state = store.get_position_state("MSFT")
+    assert msft_state is not None
+    assert msft_state.stop_order_id == "child-stop-99"
+
+    # 3) submit_limit_sell cancels only AAPL's open bracket legs before placing Limit sell
+    mock_broker.submit_order.return_value = SimpleNamespace(
+        id="broker-sell-filled",
+        status="filled",
+    )
+    sell_res = client.submit_limit_sell(
+        symbol="AAPL",
+        qty=10,
+        reference_price=198.0,
+        reason="TIME_EXIT",
+    )
+    assert sell_res.submitted is True
+    cancelled_ids = [call.args[0] for call in mock_broker.cancel_order_by_id.call_args_list]
+    assert cancelled_ids == ["leg-stop-1", "leg-tp-1"]
+    assert store.get_position_state("AAPL") is None

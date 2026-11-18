@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from src.config import StrategySettings, load_strategy_settings
+from src.config import NY_TIMEZONE, StrategySettings, load_fed_dates, load_strategy_settings
 
 
 def test_load_strategy_settings_defaults_when_file_missing(
@@ -75,3 +75,21 @@ def test_load_strategy_settings_validation_and_missing_explicit_path(
     empty_tickers.write_text(json.dumps({"tickers": []}), encoding="utf-8")
     with pytest.raises(ValueError, match="tickers"):
         load_strategy_settings(empty_tickers)
+
+
+def test_load_fed_dates_from_repo_calendar_and_missing_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_fed = Path(__file__).resolve().parents[1] / "config" / "fed_calendar.json"
+    fed_dates = load_fed_dates(repo_fed)
+    assert len(fed_dates) >= 8
+    assert all(dt.tzinfo == NY_TIMEZONE for dt in fed_dates)
+    assert any(dt.year == 2026 and dt.month == 12 and dt.day == 9 for dt in fed_dates)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FED_CALENDAR_PATH", raising=False)
+    assert load_fed_dates() == []
+
+    with pytest.raises(FileNotFoundError):
+        load_fed_dates(tmp_path / "missing_fed.json")

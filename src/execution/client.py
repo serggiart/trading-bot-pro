@@ -62,6 +62,29 @@ def _extract_broker_status(broker_order: Any, default: str = "submitted") -> str
     return text or default
 
 
+_FILLED_ORDER_STATUSES = frozenset({"filled", "partially_filled"})
+
+
+def _extract_stop_leg_id(broker_order: Any) -> str | None:
+    """Extract child stop-loss order ID from an Alpaca OTO/Bracket order if returned."""
+    legs = getattr(broker_order, "legs", None)
+    if not legs:
+        return None
+    for leg in legs:
+        type_val = str(
+            getattr(
+                getattr(leg, "order_type", getattr(leg, "type", "")),
+                "value",
+                getattr(leg, "order_type", getattr(leg, "type", "")),
+            )
+        ).lower()
+        if "stop" in type_val:
+            raw_id = getattr(leg, "id", None)
+            if raw_id is not None:
+                return str(raw_id)
+    return None
+
+
 def _generate_client_order_id(prefix: str, symbol: str) -> str:
     """Build a unique client_order_id stamped in America/New_York."""
     timestamp = ensure_ny_datetime().strftime("%Y%m%d%H%M%S")
@@ -295,7 +318,7 @@ class AlpacaExecutionClient:
             broker_order_id=broker_order_id,
             metadata=audit_metadata,
         )
-        if self.audit_store is not None:
+        if self.audit_store is not None and status in _FILLED_ORDER_STATUSES:
             raw_atr = audit_metadata.get("atr_14")
             resolved_atr = (
                 float(raw_atr)
@@ -313,6 +336,7 @@ class AlpacaExecutionClient:
                 atr_14=resolved_atr,
                 opened_at=ensure_ny_datetime(),
                 highest_price=limit_price,
+                stop_order_id=_extract_stop_leg_id(broker_order),
                 client_order_id=resolved_client_id,
             )
         return ExecutionOrderResult(
@@ -329,6 +353,39 @@ class AlpacaExecutionClient:
             reason="",
         )
 
+    def cancel_open_orders_for_symbol(
+        self,
+        symbol: str,
+        dry_run: bool = False,
+    ) -> list[str]:
+        """Cancel all open broker orders (e.g., BRACKET/OTO child legs) for a symbol."""
+        normalized_symbol = symbol.strip().upper()
+        if not normalized_symbol:
+            raise ValueError("symbol must be a non-empty string")
+        if dry_run or self._trading_client is None:
+            return []
+
+        get_orders_fn = getattr(self._trading_client, "get_orders", None)
+        cancel_fn = getattr(self._trading_client, "cancel_order_by_id", None)
+        if not callable(get_orders_fn) or not callable(cancel_fn):
+            return []
+
+        open_orders = (
+            get_orders_fn(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)) or []
+        )
+        cancelled_ids: list[str] = []
+        for order in open_orders:
+            order_symbol = str(getattr(order, "symbol", "") or "").strip().upper()
+            if order_symbol != normalized_symbol:
+                continue
+            raw_id = getattr(order, "id", None)
+            if raw_id is None:
+                continue
+            order_id = str(raw_id)
+            cancel_fn(order_id)
+            cancelled_ids.append(order_id)
+        return cancelled_ids
+
     def submit_limit_sell(
         self,
         symbol: str,
@@ -339,6 +396,7 @@ class AlpacaExecutionClient:
         dry_run: bool = False,
         reason: str = "",
         metadata: dict[str, Any] | None = None,
+        cancel_existing_orders: bool = True,
     ) -> ExecutionOrderResult:
         """Submit a LimitOrderRequest sell order with protective downward slippage collar."""
         normalized_symbol = symbol.strip().upper()
@@ -409,6 +467,15 @@ class AlpacaExecutionClient:
                 reason=reason or "Dry run enabled; sell order not sent to broker",
             )
 
+        cancelled_order_ids: list[str] = []
+        if cancel_existing_orders:
+            cancelled_order_ids = self.cancel_open_orders_for_symbol(
+                normalized_symbol,
+                dry_run=dry_run,
+            )
+        if cancelled_order_ids:
+            audit_metadata["cancelled_open_order_ids"] = cancelled_order_ids
+
         broker_order = self._require_trading_client().submit_order(
             order_data=order_request
         )
@@ -427,7 +494,7 @@ class AlpacaExecutionClient:
             broker_order_id=broker_order_id,
             metadata=audit_metadata,
         )
-        if self.audit_store is not None:
+        if self.audit_store is not None and status == "filled":
             self.audit_store.delete_position_state(normalized_symbol)
         return ExecutionOrderResult(
             submitted=True,
@@ -610,11 +677,39 @@ class AlpacaExecutionClient:
             stored = stored_by_symbol.get(symbol)
             broker_stop_id, broker_stop_price = stop_orders_by_symbol.get(symbol, (None, 0.0))
 
+            recent_buy_order = None
+            if self.audit_store is not None:
+                for rec in self.audit_store.get_orders(symbol=symbol, limit=5):
+                    if rec.side == "BUY" and rec.status != "dry_run":
+                        recent_buy_order = rec
+                        if rec.status not in _FILLED_ORDER_STATUSES:
+                            self.audit_store.update_order_status(
+                                client_order_id=rec.client_order_id,
+                                status="filled",
+                                updated_at=now_ny,
+                            )
+                        break
+
+            order_stop_price = (
+                float(recent_buy_order.stop_price)
+                if recent_buy_order is not None and recent_buy_order.stop_price is not None
+                else 0.0
+            )
+            order_atr = (
+                float(recent_buy_order.metadata["atr_14"])
+                if recent_buy_order is not None
+                and isinstance(recent_buy_order.metadata.get("atr_14"), (int, float))
+                and float(recent_buy_order.metadata["atr_14"]) > 0.0
+                else 0.0
+            )
+
             stored_stop = stored.current_stop_price if stored is not None else 0.0
-            current_stop = max(broker_stop_price, stored_stop)
+            current_stop = max(broker_stop_price, stored_stop, order_stop_price)
             atr_14 = normalized_atr.get(
                 symbol,
-                stored.atr_14 if stored is not None and stored.atr_14 > 0.0 else round(entry_price * 0.02, 4),
+                stored.atr_14
+                if stored is not None and stored.atr_14 > 0.0
+                else (order_atr if order_atr > 0.0 else round(entry_price * 0.02, 4)),
             )
             if current_stop <= 0.0:
                 current_stop = round(
@@ -622,14 +717,22 @@ class AlpacaExecutionClient:
                     2,
                 )
 
-            opened_at = stored.opened_at if stored is not None else now_ny
+            opened_at = (
+                stored.opened_at
+                if stored is not None
+                else (recent_buy_order.created_at if recent_buy_order is not None else now_ny)
+            )
             highest_price = (
                 max(entry_price, stored.highest_price)
                 if stored is not None
                 else entry_price
             )
             stop_order_id = broker_stop_id or (stored.stop_order_id if stored is not None else None)
-            client_order_id = stored.client_order_id if stored is not None else None
+            client_order_id = (
+                stored.client_order_id
+                if stored is not None
+                else (recent_buy_order.client_order_id if recent_buy_order is not None else None)
+            )
 
             if self.audit_store is not None:
                 self.audit_store.upsert_position_state(

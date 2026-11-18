@@ -8,6 +8,7 @@ from src.universe.market_data import (
     calculate_ema,
     calculate_rsi,
     calculate_sma,
+    compute_return_correlation_matrix,
     validate_cross_price,
 )
 from src.universe.models import (
@@ -37,6 +38,7 @@ __all__ = [
     "calculate_ema",
     "calculate_rsi",
     "calculate_sma",
+    "compute_return_correlation_matrix",
     "select_top_candidates",
     "validate_cross_price",
 ]

@@ -1204,3 +1204,57 @@ def test_process_lock_prevents_concurrent_instances_and_loop_backoff(tmp_path: P
     assert exit_code == 0
     assert recorded_sleeps == [10.0, 10.0]
     mock_orch.notifier.send_message.assert_called_once()
+
+
+def test_orchestrator_auto_resolves_correlation_and_fomc_blackout(tmp_path: Path) -> None:
+    import numpy as np
+    import pandas as pd
+    from src.backtest import ParquetCandleStore
+    from src.guardian import PortfolioPosition
+
+    now_ny = datetime(2026, 12, 9, 11, 0, 0, tzinfo=NY_TIMEZONE)
+    confirmed_news = [_make_news(now_ny - timedelta(minutes=5), source="Reuters")]
+
+    # 1) FOMC decision at 14:00 ET same day vetoes even when Gemini approves
+    store_fed = TradingAuditStore(tmp_path / "fed.db")
+    orch_fed, mocks_fed = _build_mock_orchestrator(
+        audit_store=store_fed,
+        screening_result=_make_screening_result("AAPL", vix=17.0),
+        news_items=confirmed_news,
+        analyst_result=_make_analyst_result("AAPL", approved=True),
+    )
+    orch_fed.default_fed_dates = (datetime(2026, 12, 9, 14, 0, 0, tzinfo=NY_TIMEZONE),)
+    fed_report = orch_fed.run_cycle(symbols=["AAPL"], now=now_ny, dry_run=False)
+    assert fed_report.ticker_outcomes[0].approved is False
+    assert fed_report.ticker_outcomes[0].status == "vetoed_guardian"
+    assert any("Fed" in r for r in fed_report.ticker_outcomes[0].reasons)
+    mocks_fed["execution_client"].submit_limit_buy.assert_not_called()
+
+    # 2) Cached Parquet candles drive automatic correlation_matrix (> 0.75 veto)
+    candle_store = ParquetCandleStore(cache_dir=tmp_path / "candles")
+    dates = pd.date_range("2026-08-01", periods=45, freq="B")
+    rets = np.random.default_rng(42).normal(0.001, 0.015, size=45)
+    candle_store.save_candles("AAPL", pd.DataFrame({"Close": 100.0 * np.cumprod(1.0 + rets)}, index=dates))
+    candle_store.save_candles("QQQ", pd.DataFrame({"Close": 200.0 * np.cumprod(1.0 + rets * 0.99)}, index=dates))
+
+    now_corr = datetime(2026, 11, 18, 11, 0, 0, tzinfo=NY_TIMEZONE)
+    store_corr = TradingAuditStore(tmp_path / "corr.db")
+    orch_corr, mocks_corr = _build_mock_orchestrator(
+        audit_store=store_corr,
+        screening_result=_make_screening_result("AAPL", vix=17.0),
+        news_items=[_make_news(now_corr - timedelta(minutes=5), source="Reuters")],
+        analyst_result=_make_analyst_result("AAPL", approved=True),
+    )
+    orch_corr._candle_store = candle_store
+
+    corr_report = orch_corr.run_cycle(
+        symbols=["AAPL"],
+        now=now_corr,
+        portfolio_positions=[
+            PortfolioPosition(symbol="QQQ", sector="Broad Market", market_value=10_000.0, shares=20, avg_price=500.0)
+        ],
+    )
+    assert corr_report.ticker_outcomes[0].approved is False
+    assert corr_report.ticker_outcomes[0].status == "vetoed_guardian"
+    assert any("Correlation" in r and "QQQ" in r for r in corr_report.ticker_outcomes[0].reasons)
+    mocks_corr["execution_client"].submit_limit_buy.assert_not_called()
