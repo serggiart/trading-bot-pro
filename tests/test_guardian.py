@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -51,7 +52,19 @@ def test_guardian_has_zero_llm_dependencies() -> None:
                         f"Forbidden LLM import {node.module} in {py_file.name}"
                     )
 
-    assert "google.genai" not in sys.modules
+    # Verify in a clean subprocess so earlier test modules (e.g. test_analyst) don't taint sys.modules
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, src.guardian; assert 'google.genai' not in sys.modules",
+        ],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Isolated import leaked LLM module: {proc.stderr}"
 
 
 # ---------------------------------------------------------------------------
