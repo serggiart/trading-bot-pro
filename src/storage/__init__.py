@@ -13,6 +13,7 @@ from src.storage.models import (
     FmpCacheEntry,
     GuardianDecisionRecord,
     OrderRecord,
+    PositionStateRecord,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "FmpCacheEntry",
     "GuardianDecisionRecord",
     "OrderRecord",
+    "PositionStateRecord",
 ]

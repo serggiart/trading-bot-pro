@@ -1,0 +1,14 @@
+.venv/
+.git/
+.env
+.env.*
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+data/*.db*
+data/*.lock
+data/candles/
+data/*.parquet
+config/strategy.local.json
+logs/

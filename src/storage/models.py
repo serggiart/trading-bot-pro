@@ -72,3 +72,19 @@ class OrderRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(NY_TIMEZONE))
     updated_at: datetime = field(default_factory=lambda: datetime.now(NY_TIMEZONE))
+
+
+@dataclass(frozen=True, slots=True)
+class PositionStateRecord:
+    """Crash-safe persisted state for an active ManagedPosition."""
+
+    symbol: str
+    qty: float
+    entry_price: float
+    current_stop_price: float
+    highest_price: float
+    atr_14: float
+    opened_at: datetime
+    stop_order_id: str | None = None
+    client_order_id: str | None = None
+    updated_at: datetime = field(default_factory=lambda: datetime.now(NY_TIMEZONE))

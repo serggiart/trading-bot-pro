@@ -23,6 +23,7 @@ class UniverseConfig:
     sma_period: int = 200
     fmp_daily_limit: int = 250
     fmp_cache_ttl_hours: float = 24.0
+    max_candidates_for_ai: int = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +65,8 @@ class TechnicalIndicators:
     vix: float
     latest_volume: float = 0.0
     avg_volume_20d: float = 0.0
+    ema_20: float = 0.0
+    rsi_14: float = 50.0
 
 
 @dataclass(frozen=True, slots=True)

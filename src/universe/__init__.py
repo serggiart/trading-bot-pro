@@ -5,6 +5,8 @@ from src.universe.market_data import (
     MarketDataClient,
     calculate_atr,
     calculate_avg_volume,
+    calculate_ema,
+    calculate_rsi,
     calculate_sma,
     validate_cross_price,
 )
@@ -16,7 +18,7 @@ from src.universe.models import (
     UniverseConfig,
     UniverseScreeningResult,
 )
-from src.universe.screener import UniverseScreener
+from src.universe.screener import UniverseScreener, select_top_candidates
 
 __all__ = [
     "FmpApiError",
@@ -32,6 +34,9 @@ __all__ = [
     "UniverseScreeningResult",
     "calculate_atr",
     "calculate_avg_volume",
+    "calculate_ema",
+    "calculate_rsi",
     "calculate_sma",
+    "select_top_candidates",
     "validate_cross_price",
 ]

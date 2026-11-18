@@ -10,6 +10,40 @@ from src.universe.market_data import MarketDataClient
 from src.universe.models import UniverseConfig, UniverseScreeningResult
 
 
+def _compute_setup_score(result: UniverseScreeningResult) -> float:
+    """Score a passed screening result by EMA(20) trend, relative volume, and RSI sweet spot."""
+    ind = result.indicators
+    if ind is None:
+        return 0.0
+
+    score = 0.0
+    if ind.ema_20 > 0.0 and ind.current_price > ind.ema_20:
+        score += 2.0
+
+    if ind.avg_volume_20d > 0.0 and ind.latest_volume > 0.0:
+        rel_vol = ind.latest_volume / ind.avg_volume_20d
+        score += min(rel_vol, 3.0)
+
+    if 30.0 <= ind.rsi_14 <= 65.0:
+        score += 1.5
+    elif ind.rsi_14 < 30.0:
+        score += 0.75
+
+    return score
+
+
+def select_top_candidates(
+    results: Sequence[UniverseScreeningResult],
+    max_candidates: int = 5,
+) -> list[UniverseScreeningResult]:
+    """Filter passing screening results and rank deterministically by technical setup score."""
+    if max_candidates <= 0:
+        return []
+    passing = [(idx, r) for idx, r in enumerate(results) if r.passed]
+    passing.sort(key=lambda item: (-_compute_setup_score(item[1]), item[0]))
+    return [r for _, r in passing[:max_candidates]]
+
+
 class UniverseScreener:
     """Deterministic Stage-1 screener for equity universe eligibility."""
 

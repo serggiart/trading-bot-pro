@@ -27,6 +27,7 @@ class ExecutionConfig:
     exit_slippage_pct: float = 0.003
     emergency_slippage_pct: float = 0.015
     trailing_atr_multiplier: float = 2.0
+    take_profit_atr_multiplier: float = 2.0
     max_hold_hours: float = 72.0
     min_target_return_pct: float = 0.01
     flash_crash_window_minutes: float = 5.0
@@ -42,6 +43,8 @@ class ExecutionConfig:
             raise ValueError("emergency_slippage_pct must be in [0, 1.0)")
         if self.trailing_atr_multiplier <= 0:
             raise ValueError("trailing_atr_multiplier must be positive")
+        if self.take_profit_atr_multiplier < 0:
+            raise ValueError("take_profit_atr_multiplier must be non-negative")
         if self.max_hold_hours <= 0:
             raise ValueError("max_hold_hours must be positive")
         if self.flash_crash_window_minutes <= 0:
@@ -75,6 +78,17 @@ class ManagedPosition:
         if self.current_stop_price < 0:
             raise ValueError("current_stop_price must be non-negative")
         self.opened_at = ensure_ny_datetime(self.opened_at)
+
+
+@dataclass(frozen=True, slots=True)
+class AccountSnapshot:
+    """Broker account equity, liquidity, and daily PnL snapshot."""
+
+    equity: float
+    cash: float
+    buying_power: float
+    last_equity: float
+    daily_pnl: float
 
 
 @dataclass(frozen=True, slots=True)

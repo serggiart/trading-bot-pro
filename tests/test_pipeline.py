@@ -894,3 +894,313 @@ def test_intraday_run_rate_volume_projection_used_by_orchestrator() -> None:
     eval_kwargs = mocks["analyst"].evaluate.call_args.kwargs
     assert eval_kwargs["current_volume"] == pytest.approx(60_000_000.0)
     assert eval_kwargs["avg_volume_20d"] == pytest.approx(40_000_000.0)
+
+
+def test_orchestrator_passes_bracket_take_profit_price() -> None:
+    now_ny = datetime(2026, 11, 18, 10, 30, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(":memory:")
+    orchestrator, mocks = _build_mock_orchestrator(
+        audit_store=store,
+        screening_result=_make_screening_result("AAPL", price=200.0, ask_price=200.10, atr_14=4.0),
+        news_items=[_make_news(now_ny - timedelta(minutes=5), source="Reuters")],
+        analyst_result=_make_analyst_result("AAPL", approved=True),
+    )
+
+    report = orchestrator.run_cycle(symbols=["AAPL"], now=now_ny, dry_run=False)
+    assert report.ticker_outcomes[0].approved is True
+    call_kwargs = mocks["execution_client"].submit_limit_buy.call_args.kwargs
+    # 200.10 + 2.0 * 4.0 = 208.10
+    assert call_kwargs["take_profit_price"] == pytest.approx(208.10)
+
+
+def test_orchestrator_sync_account_compounds_equity_and_positions() -> None:
+    from src.execution import AccountSnapshot
+    from src.guardian import PortfolioPosition
+
+    now_ny = datetime(2026, 11, 18, 10, 30, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(":memory:")
+    orchestrator, mocks = _build_mock_orchestrator(
+        audit_store=store,
+        screening_result=_make_screening_result("AAPL", price=200.0, ask_price=200.0, atr_14=2.0),
+        news_items=[_make_news(now_ny - timedelta(minutes=5), source="Reuters")],
+        analyst_result=_make_analyst_result("AAPL", approved=True),
+    )
+
+    # Compounded account grew from $10,000 -> $25,000; open position in MSFT shouldn't block AAPL
+    mocks["execution_client"].get_account_snapshot.return_value = AccountSnapshot(
+        equity=25_000.0,
+        cash=20_000.0,
+        buying_power=45_000.0,
+        last_equity=24_000.0,
+        daily_pnl=1_000.0,
+    )
+    mocks["execution_client"].get_open_positions.return_value = [
+        PortfolioPosition(symbol="MSFT", sector="Technology", market_value=5_000.0, shares=12, avg_price=415.0)
+    ]
+
+    report = orchestrator.run_cycle(
+        symbols=["AAPL"],
+        now=now_ny,
+        dry_run=False,
+        starting_equity=10_000.0,
+        sync_account=True,
+    )
+    outcome = report.ticker_outcomes[0]
+    assert outcome.approved is True
+    assert outcome.guardian_decision is not None
+    # Compounded capital = 24,000 + 1,000 = 25,000; 35% Technology cap ($8,750) minus synced MSFT ($5,000) = $3,750 -> 18 shares
+    # (Whereas unsynced starting_equity=10,000 would cap at 20% = $2,000 -> 10 shares.)
+    assert outcome.guardian_decision.recommended_shares == 18
+
+    # If synced position already holds AAPL, RiskGuardian vetoes duplicate entry
+    mocks["execution_client"].get_open_positions.return_value = [
+        PortfolioPosition(symbol="AAPL", sector="Technology", market_value=4_000.0, shares=20, avg_price=200.0)
+    ]
+    dup_report = orchestrator.run_cycle(
+        symbols=["AAPL"],
+        now=now_ny,
+        dry_run=False,
+        sync_account=True,
+    )
+    assert dup_report.ticker_outcomes[0].approved is False
+    assert dup_report.ticker_outcomes[0].status == "vetoed_guardian"
+
+
+def test_orchestrator_limits_ai_calls_to_max_candidates_for_ai() -> None:
+    now_ny = datetime(2026, 11, 18, 10, 30, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(":memory:")
+
+    screening_map = {
+        "LOW": UniverseScreeningResult(
+            symbol="LOW",
+            passed=True,
+            indicators=TechnicalIndicators(
+                symbol="LOW",
+                current_price=95.0,
+                sma_200=80.0,
+                atr_14=2.0,
+                above_sma_200=True,
+                vix=18.0,
+                latest_volume=900_000.0,
+                avg_volume_20d=1_000_000.0,
+                ema_20=100.0,
+                rsi_14=75.0,
+            ),
+            quote=MarketQuote("LOW", 95.0, 94.9, 95.1, 0.002, 1_000_000.0),
+            fundamentals=FundamentalData("LOW", 1e9, 0.5),
+        ),
+        "TOP1": UniverseScreeningResult(
+            symbol="TOP1",
+            passed=True,
+            indicators=TechnicalIndicators(
+                symbol="TOP1",
+                current_price=150.0,
+                sma_200=120.0,
+                atr_14=2.5,
+                above_sma_200=True,
+                vix=18.0,
+                latest_volume=2_400_000.0,
+                avg_volume_20d=1_000_000.0,
+                ema_20=140.0,
+                rsi_14=56.0,
+            ),
+            quote=MarketQuote("TOP1", 150.0, 149.9, 150.1, 0.001, 2_400_000.0),
+            fundamentals=FundamentalData("TOP1", 2e9, 0.4),
+        ),
+        "TOP2": UniverseScreeningResult(
+            symbol="TOP2",
+            passed=True,
+            indicators=TechnicalIndicators(
+                symbol="TOP2",
+                current_price=210.0,
+                sma_200=180.0,
+                atr_14=3.0,
+                above_sma_200=True,
+                vix=18.0,
+                latest_volume=1_600_000.0,
+                avg_volume_20d=1_000_000.0,
+                ema_20=200.0,
+                rsi_14=54.0,
+            ),
+            quote=MarketQuote("TOP2", 210.0, 209.9, 210.1, 0.001, 1_600_000.0),
+            fundamentals=FundamentalData("TOP2", 2e9, 0.4),
+        ),
+        "FAIL": _make_screening_result("FAIL", passed=False),
+    }
+
+    orchestrator, mocks = _build_mock_orchestrator(
+        audit_store=store,
+        screening_result=screening_map["TOP1"],
+        news_items=[_make_news(now_ny - timedelta(minutes=5))],
+        analyst_result=_make_analyst_result("TOP1", approved=True),
+    )
+    orchestrator.max_candidates_for_ai = 2
+    mocks["screener"].screen_symbol.side_effect = lambda sym, **kw: screening_map[sym]
+    mocks["analyst"].evaluate.side_effect = lambda **kw: _make_analyst_result(kw["symbol"], approved=True)
+
+    report = orchestrator.run_cycle(
+        symbols=["LOW", "TOP1", "FAIL", "TOP2"],
+        now=now_ny,
+        dry_run=True,
+    )
+
+    assert [o.symbol for o in report.ticker_outcomes] == ["LOW", "TOP1", "FAIL", "TOP2"]
+    assert report.ticker_outcomes[0].status == "filtered_max_candidates"
+    assert report.ticker_outcomes[2].status == "rejected_universe"
+    assert report.ticker_outcomes[1].approved is True
+    assert report.ticker_outcomes[3].approved is True
+
+    fetched_symbols = [call.args[0] for call in mocks["news_aggregator"].fetch_news.call_args_list]
+    evaluated_symbols = [call.kwargs["symbol"] for call in mocks["analyst"].evaluate.call_args_list]
+    assert fetched_symbols == ["TOP1", "TOP2"]
+    assert evaluated_symbols == ["TOP1", "TOP2"]
+
+
+def test_cli_backtest_flag_and_new_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+    import sys
+    from types import ModuleType, SimpleNamespace
+    import pandas as pd
+
+    cfg_path = tmp_path / "strategy.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "tickers": ["AAPL", "MSFT"],
+                "atr_stop_multiplier": 2.0,
+                "atr_take_profit_multiplier": 2.0,
+                "max_hold_bars": 10,
+                "rsi_entry_max": 60.0,
+                "min_relative_volume": 1.2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_args(
+        [
+            "--tickers",
+            "AAPL",
+            "NVDA",
+            "--config",
+            str(cfg_path),
+            "--backtest",
+            "--backtest-period",
+            "6mo",
+            "--initial-capital",
+            "25000",
+            "--max-candidates",
+            "3",
+            "--sync-account",
+        ]
+    )
+    assert args.backtest is True
+    assert args.backtest_period == "6mo"
+    assert args.initial_capital == 25000.0
+    assert args.max_candidates == 3
+    assert args.sync_account is True
+
+    fake_backtest = ModuleType("src.backtest")
+    mock_store = MagicMock()
+    mock_store.get_or_fetch_candles.return_value = pd.DataFrame({"Close": [100.0, 105.0]})
+
+    mock_engine = MagicMock()
+    mock_engine.run.return_value = SimpleNamespace(
+        metrics=SimpleNamespace(
+            total_trades=12,
+            win_rate=0.625,
+            profit_factor=2.15,
+            max_drawdown_pct=0.045,
+            total_return_pct=0.184,
+            initial_capital=25000.0,
+            final_equity=29600.0,
+            compounded_pnl=4600.0,
+        ),
+        vetoed_entries_count=3,
+    )
+
+    fake_backtest.BacktestConfig = MagicMock(return_value="cfg")
+    fake_backtest.ParquetCandleStore = MagicMock(return_value=mock_store)
+    fake_backtest.BacktestEngine = MagicMock(return_value=mock_engine)
+    monkeypatch.setitem(sys.modules, "src.backtest", fake_backtest)
+
+    code = main(
+        [
+            "--tickers",
+            "aapl",
+            "msft",
+            "--config",
+            str(cfg_path),
+            "--backtest",
+            "--backtest-period",
+            "1y",
+            "--initial-capital",
+            "25000",
+        ]
+    )
+    assert code == 0
+    mock_store.get_or_fetch_candles.assert_any_call("AAPL", period="1y")
+    mock_store.get_or_fetch_candles.assert_any_call("MSFT", period="1y")
+    fake_backtest.BacktestConfig.assert_called_once_with(
+        initial_capital=25000.0,
+        atr_stop_multiplier=2.0,
+        atr_take_profit_multiplier=2.0,
+        max_hold_bars=10,
+        rsi_entry_max=60.0,
+        min_relative_volume=1.2,
+    )
+    mock_engine.run.assert_called_once()
+
+    captured = capsys.readouterr().out
+    assert "Total Trades" in captured
+    assert "Win Rate" in captured
+    assert "Profit Factor" in captured
+    assert "Max Drawdown" in captured
+    assert "Total Return" in captured
+    assert "Final Equity" in captured
+
+
+def test_process_lock_prevents_concurrent_instances_and_loop_backoff(tmp_path: Path) -> None:
+    from main import ProcessLock, ProcessLockError
+
+    lock_file = tmp_path / "bot.lock"
+    with ProcessLock(lock_file):
+        with pytest.raises(ProcessLockError, match="already running"):
+            with ProcessLock(lock_file):
+                pass
+
+    # After release, lock can be acquired cleanly again
+    with ProcessLock(lock_file):
+        assert lock_file.exists()
+
+    # Loop recovers from transient exception with backoff and Telegram alert
+    mock_orch = MagicMock(spec=TradingBotOrchestrator)
+    mock_orch.notifier = MagicMock()
+    mock_orch.run_cycle.side_effect = [
+        RuntimeError("transient network drop"),
+        PipelineCycleReport(
+            timestamp=datetime(2026, 11, 18, 12, 0, tzinfo=NY_TIMEZONE),
+            market_open=True,
+            skipped=False,
+            dry_run=True,
+        ),
+    ]
+    recorded_sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        recorded_sleeps.append(seconds)
+        if len(recorded_sleeps) >= 2:
+            raise KeyboardInterrupt
+
+    exit_code = main(
+        argv=["--tickers", "AAPL", "--loop", "--interval-seconds", "10", "--ignore-market-hours"],
+        orchestrator=mock_orch,
+        sleep_fn=fake_sleep,
+    )
+    assert exit_code == 0
+    assert recorded_sleeps == [10.0, 10.0]
+    mock_orch.notifier.send_message.assert_called_once()

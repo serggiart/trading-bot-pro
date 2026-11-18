@@ -461,3 +461,45 @@ def test_in_memory_store_and_validation_guards() -> None:
 
         with pytest.raises(ValueError, match="limit"):
             mem_store.get_orders(limit=0)
+
+
+def test_position_state_persistence_and_cleanup(store: TradingAuditStore) -> None:
+    """position_state upserts, preserves stop_order_id on partial updates, and deletes cleanly."""
+    opened = datetime(2026, 11, 18, 9, 35, tzinfo=NY_TIMEZONE)
+    rec = store.upsert_position_state(
+        symbol="aapl",
+        qty=10.0,
+        entry_price=200.0,
+        current_stop_price=195.0,
+        atr_14=2.5,
+        opened_at=opened,
+        highest_price=201.0,
+        stop_order_id="stop-1",
+        client_order_id="cid-1",
+    )
+    assert rec.symbol == "AAPL"
+    assert rec.current_stop_price == pytest.approx(195.0)
+    assert rec.stop_order_id == "stop-1"
+
+    # Upsert without stop_order_id preserves existing stop_order_id via COALESCE
+    updated = store.upsert_position_state(
+        symbol="AAPL",
+        qty=10.0,
+        entry_price=200.0,
+        current_stop_price=198.0,
+        atr_14=2.5,
+        opened_at=opened,
+        highest_price=204.0,
+    )
+    assert updated.current_stop_price == pytest.approx(198.0)
+    assert updated.highest_price == pytest.approx(204.0)
+    assert updated.stop_order_id == "stop-1"
+
+    states = store.get_open_position_states()
+    assert len(states) == 1
+    assert states[0].symbol == "AAPL"
+    assert store.get_position_state("aapl") is not None
+
+    assert store.delete_position_state("AAPL") is True
+    assert store.delete_position_state("AAPL") is False
+    assert store.get_position_state("AAPL") is None

@@ -18,12 +18,19 @@ from src.universe import (
     FmpApiError,
     FmpClient,
     FmpRateLimitError,
+    FundamentalData,
     MarketDataClient,
+    PriceValidationResult,
+    TechnicalIndicators,
     UniverseConfig,
     UniverseScreener,
+    UniverseScreeningResult,
     calculate_atr,
     calculate_avg_volume,
+    calculate_ema,
+    calculate_rsi,
     calculate_sma,
+    select_top_candidates,
     validate_cross_price,
 )
 
@@ -499,3 +506,119 @@ def test_universe_screener_collects_multiple_rejections_and_batches_vix(tmp_path
             assert len(res.rejection_reasons) >= 4
     finally:
         store.close()
+
+
+# ------------------------------------------------------------------
+# Batch Quotes, EMA(20), RSI(14), and Candidate Ranking Tests
+# ------------------------------------------------------------------
+
+
+def test_get_quotes_batch_fetches_all_symbols_in_single_request() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_stock_snapshot.return_value = {
+        "AAPL": _make_mock_snapshot("AAPL", trade_price=190.0, bid_price=189.9, ask_price=190.1),
+        "MSFT": _make_mock_snapshot("MSFT", trade_price=420.0, bid_price=419.8, ask_price=420.2),
+    }
+
+    client = MarketDataClient(alpaca_client=mock_alpaca)
+    assert client.get_quotes_batch([]) == {}
+    mock_alpaca.get_stock_snapshot.assert_not_called()
+
+    quotes = client.get_quotes_batch(["aapl", "MSFT", "AAPL"])
+    mock_alpaca.get_stock_snapshot.assert_called_once()
+    req_arg = mock_alpaca.get_stock_snapshot.call_args.args[0]
+    assert isinstance(req_arg, StockSnapshotRequest)
+    assert req_arg.symbol_or_symbols == ["AAPL", "MSFT"]
+    assert req_arg.feed == DataFeed.IEX
+
+    assert set(quotes.keys()) == {"AAPL", "MSFT"}
+    assert quotes["AAPL"].price == pytest.approx(190.0)
+    assert quotes["MSFT"].price == pytest.approx(420.0)
+
+
+def test_calculate_ema_and_rsi_accuracy_and_zero_loss_safety() -> None:
+    # Exact EMA(3) over [10, 11, 12, 13]: SMA(3)=11.0, k=0.5 -> 13*0.5 + 11*0.5 = 12.0
+    assert calculate_ema([10.0, 11.0, 12.0, 13.0], period=3) == pytest.approx(12.0)
+    with pytest.raises(ValueError, match="Insufficient"):
+        calculate_ema([10.0, 11.0], period=3)
+
+    # Monotonic uptrend (zero losses) -> RSI == 100.0 without ZeroDivisionError
+    assert calculate_rsi([100.0 + i for i in range(20)], period=14) == pytest.approx(100.0)
+    # Monotonic downtrend (zero gains) -> RSI == 0.0
+    assert calculate_rsi([100.0 - i for i in range(20)], period=14) == pytest.approx(0.0)
+    # Flat closes -> RSI == 50.0
+    assert calculate_rsi([100.0] * 20, period=14) == pytest.approx(50.0)
+
+    with pytest.raises(ValueError, match="Insufficient"):
+        calculate_rsi([100.0] * 14, period=14)
+
+
+def test_market_data_client_populates_ema20_and_rsi14() -> None:
+    closes = [100.0 + i * 0.5 for i in range(210)]
+    stock_df = _make_ohlcv_df(closes, spread=2.0)
+    vix_df = _make_ohlcv_df([17.5], spread=0.2)
+
+    def _ticker_factory(sym: str) -> MagicMock:
+        ticker = MagicMock()
+        ticker.history.return_value = vix_df if sym == "^VIX" else stock_df
+        return ticker
+
+    client = MarketDataClient(ticker_factory=_ticker_factory)
+    ind = client.get_technical_indicators("NVDA")
+    assert ind.ema_20 == pytest.approx(calculate_ema(closes, period=20))
+    assert ind.rsi_14 == pytest.approx(100.0)
+
+
+def test_select_top_candidates_filters_and_ranks_deterministically() -> None:
+    def _candidate(
+        symbol: str,
+        *,
+        passed: bool = True,
+        price: float = 110.0,
+        ema_20: float = 100.0,
+        latest_vol: float = 1_500_000.0,
+        avg_vol: float = 1_000_000.0,
+        rsi_14: float = 55.0,
+    ) -> UniverseScreeningResult:
+        return UniverseScreeningResult(
+            symbol=symbol,
+            passed=passed,
+            rejection_reasons=[] if passed else ["Failed"],
+            validation=PriceValidationResult(
+                symbol=symbol,
+                alpaca_price=price,
+                yfinance_price=price,
+                z_score=0.0,
+                pct_diff=0.0,
+                is_valid=True,
+            ),
+            indicators=TechnicalIndicators(
+                symbol=symbol,
+                current_price=price,
+                sma_200=90.0,
+                atr_14=2.0,
+                above_sma_200=True,
+                vix=18.0,
+                latest_volume=latest_vol,
+                avg_volume_20d=avg_vol,
+                ema_20=ema_20,
+                rsi_14=rsi_14,
+            ),
+            fundamentals=FundamentalData(
+                symbol=symbol,
+                free_cash_flow=1_000_000.0,
+                debt_to_equity=0.5,
+            ),
+        )
+
+    candidates = [
+        _candidate("FAIL", passed=False, latest_vol=3_000_000.0),
+        _candidate("OVERBOUGHT", rsi_14=78.0, latest_vol=1_200_000.0),
+        _candidate("BELOW_EMA", price=98.0, ema_20=100.0, latest_vol=1_500_000.0),
+        _candidate("TOP1", rsi_14=56.0, latest_vol=2_500_000.0),
+        _candidate("TOP2", rsi_14=52.0, latest_vol=1_500_000.0),
+    ]
+
+    selected = select_top_candidates(candidates, max_candidates=2)
+    assert [c.symbol for c in selected] == ["TOP1", "TOP2"]
+    assert select_top_candidates(candidates, max_candidates=0) == []

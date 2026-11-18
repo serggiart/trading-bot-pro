@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
+import signal
 import time as time_module
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -14,7 +16,8 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from src.analyst import AnalystEvaluationResult, GeminiAnalyst, NewsAggregator, NewsItem
+from src.analyst import AnalystConfig, AnalystEvaluationResult, GeminiAnalyst, NewsAggregator, NewsItem
+from src.config import StrategySettings, load_strategy_settings
 from src.guardian import (
     GuardianDecision,
     MarketContext,
@@ -29,6 +32,7 @@ from src.universe import (
     MarketDataClient,
     UniverseScreener,
     UniverseScreeningResult,
+    select_top_candidates,
 )
 
 if TYPE_CHECKING:
@@ -45,6 +49,50 @@ logger = logging.getLogger(__name__)
 NY_TIMEZONE = ZoneInfo("America/New_York")
 MARKET_OPEN_TIME = time(9, 30)
 MARKET_CLOSE_TIME = time(16, 0)
+
+
+class ProcessLockError(RuntimeError):
+    """Raised when another instance of the trading bot already holds the runtime lock."""
+
+
+class ProcessLock:
+    """Non-blocking advisory file lock preventing concurrent bot instances."""
+
+    def __init__(self, lock_path: Path) -> None:
+        self.lock_path = Path(lock_path)
+        self._handle: Any | None = None
+
+    def __enter__(self) -> ProcessLock:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise ProcessLockError(
+                f"Another trading bot instance is already running (lock: {self.lock_path})"
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os_getpid()}\n")
+        handle.flush()
+        self._handle = handle
+        return self
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        if self._handle is not None:
+            try:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._handle.close()
+                self._handle = None
+
+
+def os_getpid() -> int:
+    """Return current process ID (indirected cleanly for clarity)."""
+    import os
+
+    return os.getpid()
 
 
 def normalize_ny_datetime(now: datetime | None = None) -> datetime:
@@ -193,6 +241,8 @@ class TradingBotOrchestrator:
         max_confirmation_delay_minutes: float = 5.0,
         default_sector: str = "Technology",
         sector_map: Mapping[str, str] | None = None,
+        take_profit_atr_multiplier: float = 2.0,
+        max_candidates_for_ai: int = 5,
     ) -> None:
         self.audit_store = audit_store or TradingAuditStore()
         self.guardian = guardian or RiskGuardian()
@@ -210,6 +260,8 @@ class TradingBotOrchestrator:
         self.sector_map: dict[str, str] = {
             k.strip().upper(): v for k, v in (sector_map or {}).items()
         }
+        self.take_profit_atr_multiplier = float(take_profit_atr_multiplier)
+        self.max_candidates_for_ai = int(max_candidates_for_ai)
 
     @property
     def screener(self) -> UniverseScreener:
@@ -355,10 +407,13 @@ class TradingBotOrchestrator:
         current_prices: Mapping[str, float],
         current_volumes: Mapping[str, float],
         avg_volumes_20d: Mapping[str, float],
+        pre_screened: UniverseScreeningResult | None = None,
     ) -> TickerPipelineOutcome:
         """Run a single symbol sequentially through stages 1-5 of the decision funnel."""
         # Stage 1: Universe screening
-        if shared_vix is not None:
+        if pre_screened is not None:
+            screening = pre_screened
+        elif shared_vix is not None:
             screening = self.screener.screen_symbol(symbol, now=now_ny, vix=shared_vix)
         else:
             screening = self.screener.screen_symbol(symbol, now=now_ny)
@@ -529,12 +584,20 @@ class TradingBotOrchestrator:
             if decision.position_size is not None
             else max(0.01, ask_price - self.guardian.config.atr_multiplier * indicators.atr_14)
         )
+        take_profit_price: float | None = None
+        if self.take_profit_atr_multiplier > 0.0 and indicators.atr_14 > 0.0:
+            take_profit_price = round(
+                ask_price + self.take_profit_atr_multiplier * indicators.atr_14,
+                2,
+            )
         order_result = self.execution_client.submit_limit_buy(
             symbol=symbol,
             qty=decision.recommended_shares,
             ask_price=ask_price,
             stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
             dry_run=dry_run,
+            metadata={"atr_14": indicators.atr_14},
         )
 
         executed = bool(order_result.submitted) or (
@@ -573,6 +636,46 @@ class TradingBotOrchestrator:
             order_result=order_result,
         )
 
+    def _sync_broker_account_state(
+        self,
+        starting_equity: float,
+        daily_pnl: float,
+        portfolio_positions: Sequence[PortfolioPosition],
+    ) -> tuple[float, float, Sequence[PortfolioPosition]]:
+        """Sync live/paper equity, daily PnL, and open positions from the broker for compounding."""
+        snapshot = self.execution_client.get_account_snapshot()
+        resolved_equity = starting_equity
+        resolved_pnl = daily_pnl
+        if snapshot is not None:
+            raw_last_equity = getattr(snapshot, "last_equity", None)
+            raw_equity = getattr(snapshot, "equity", None)
+            raw_daily_pnl = getattr(snapshot, "daily_pnl", None)
+            if isinstance(raw_last_equity, (int, float)) and raw_last_equity > 0.0:
+                resolved_equity = float(raw_last_equity)
+            elif isinstance(raw_equity, (int, float)) and raw_equity > 0.0:
+                resolved_equity = float(raw_equity)
+            if isinstance(raw_daily_pnl, (int, float)):
+                resolved_pnl = float(raw_daily_pnl)
+
+        resolved_positions = portfolio_positions
+        synced_positions = self.execution_client.get_open_positions()
+        if isinstance(synced_positions, Sequence):
+            if synced_positions:
+                resolved_positions = [
+                    PortfolioPosition(
+                        symbol=pos.symbol,
+                        sector=pos.sector or self.sector_map.get(pos.symbol.strip().upper(), self.default_sector),
+                        market_value=pos.market_value,
+                        shares=pos.shares,
+                        avg_price=pos.avg_price,
+                    )
+                    for pos in synced_positions
+                ]
+            elif snapshot is not None:
+                resolved_positions = []
+
+        return resolved_equity, resolved_pnl, resolved_positions
+
     def run_cycle(
         self,
         symbols: Sequence[str],
@@ -589,6 +692,7 @@ class TradingBotOrchestrator:
         current_volumes: Mapping[str, float] | None = None,
         avg_volumes_20d: Mapping[str, float] | None = None,
         bid_prices: Mapping[str, float] | None = None,
+        sync_account: bool = False,
     ) -> PipelineCycleReport:
         """Execute a full trading cycle respecting market hours, exits, and 5-stage funnel."""
         now_ny = normalize_ny_datetime(now)
@@ -604,6 +708,19 @@ class TradingBotOrchestrator:
                 skip_reason=reason,
                 dry_run=dry_run,
             )
+
+        if sync_account:
+            starting_equity, daily_pnl, portfolio_positions = self._sync_broker_account_state(
+                starting_equity=starting_equity,
+                daily_pnl=daily_pnl,
+                portfolio_positions=portfolio_positions,
+            )
+            if not open_positions:
+                reconcile_fn = getattr(self.execution_client, "reconcile_managed_positions", None)
+                if callable(reconcile_fn):
+                    reconciled = reconcile_fn(now=now_ny)
+                    if isinstance(reconciled, Sequence):
+                        open_positions = reconciled
 
         exit_results = (
             self._manage_open_positions(
@@ -630,15 +747,82 @@ class TradingBotOrchestrator:
             correlation_matrix if correlation_matrix is not None else {}
         )
 
+        cleaned_symbols = [raw.strip().upper() for raw in symbols if raw.strip()]
         shared_vix: float | None = None
-        if symbols and type(self.screener) is UniverseScreener:
+        if cleaned_symbols and type(self.screener) is UniverseScreener:
             shared_vix = self.screener.market_data.get_vix()
 
+        pre_screened_map: dict[str, UniverseScreeningResult] = {}
+        pre_screen_errors: dict[str, str] = {}
+        selected_symbols: set[str] | None = None
+
+        if len(cleaned_symbols) > 1 and self.max_candidates_for_ai > 0:
+            for symbol in cleaned_symbols:
+                try:
+                    if shared_vix is not None:
+                        pre_screened_map[symbol] = self.screener.screen_symbol(
+                            symbol,
+                            now=now_ny,
+                            vix=shared_vix,
+                        )
+                    else:
+                        pre_screened_map[symbol] = self.screener.screen_symbol(
+                            symbol,
+                            now=now_ny,
+                        )
+                except Exception as exc:
+                    logger.exception("Error pre-screening symbol %s: %s", symbol, exc)
+                    pre_screen_errors[symbol] = str(exc)
+
+            top_candidates = select_top_candidates(
+                list(pre_screened_map.values()),
+                max_candidates=self.max_candidates_for_ai,
+            )
+            selected_symbols = {candidate.symbol for candidate in top_candidates}
+
         outcomes: list[TickerPipelineOutcome] = []
-        for raw_symbol in symbols:
-            symbol = raw_symbol.strip().upper()
-            if not symbol:
+        for symbol in cleaned_symbols:
+            if symbol in pre_screen_errors:
+                outcomes.append(
+                    TickerPipelineOutcome(
+                        symbol=symbol,
+                        stage_reached="error",
+                        status="error",
+                        approved=False,
+                        reasons=[pre_screen_errors[symbol]],
+                    )
+                )
                 continue
+
+            pre_screened = pre_screened_map.get(symbol)
+            if selected_symbols is not None and pre_screened is not None:
+                if not pre_screened.passed:
+                    outcomes.append(
+                        TickerPipelineOutcome(
+                            symbol=symbol,
+                            stage_reached="universe",
+                            status="rejected_universe",
+                            approved=False,
+                            reasons=list(pre_screened.rejection_reasons),
+                            screening_result=pre_screened,
+                        )
+                    )
+                    continue
+                if symbol not in selected_symbols:
+                    outcomes.append(
+                        TickerPipelineOutcome(
+                            symbol=symbol,
+                            stage_reached="universe_ranking",
+                            status="filtered_max_candidates",
+                            approved=False,
+                            reasons=[
+                                f"Outside top {self.max_candidates_for_ai} candidates for AI analysis"
+                            ],
+                            screening_result=pre_screened,
+                        )
+                    )
+                    continue
+
             try:
                 outcome = self._process_symbol(
                     symbol=symbol,
@@ -653,6 +837,7 @@ class TradingBotOrchestrator:
                     current_prices=normalized_prices,
                     current_volumes=normalized_cur_vols,
                     avg_volumes_20d=normalized_avg_vols,
+                    pre_screened=pre_screened,
                 )
             except Exception as exc:
                 logger.exception("Error processing symbol %s: %s", symbol, exc)
@@ -684,8 +869,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--tickers",
         nargs="+",
-        default=["AAPL", "MSFT", "NVDA"],
-        help="List of equity ticker symbols to evaluate (default: AAPL MSFT NVDA)",
+        default=None,
+        help="List of equity ticker symbols to evaluate (defaults to strategy config or AAPL MSFT NVDA)",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to strategy JSON config (defaults to config/strategy.local.json if present)",
+    )
+    parser.add_argument(
+        "--lock-file",
+        type=Path,
+        default=None,
+        help="Advisory runtime lockfile path preventing duplicate bot instances",
     )
     parser.add_argument(
         "--dry-run",
@@ -714,11 +911,136 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_DB_PATH,
         help="SQLite audit database path (default: data/trading_audit.db)",
     )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="Run historical walk-forward backtest over cached/fetched OHLCV data and exit",
+    )
+    parser.add_argument(
+        "--backtest-period",
+        default="1y",
+        help="Historical lookback period for --backtest mode (default: 1y)",
+    )
+    parser.add_argument(
+        "--initial-capital",
+        type=float,
+        default=10000.0,
+        help="Initial capital for --backtest mode (default: 10000.0)",
+    )
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=None,
+        help="Maximum top-ranked Stage-1 candidates passed to AI news/sentiment analysis (defaults to strategy config or 5)",
+    )
+    parser.add_argument(
+        "--sync-account",
+        action="store_true",
+        help="Sync live/paper Alpaca account equity, daily PnL, and open positions for compounding",
+    )
 
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.interval_seconds <= 0:
         parser.error("--interval-seconds must be strictly positive")
+    if args.initial_capital <= 0:
+        parser.error("--initial-capital must be strictly positive")
+    if args.max_candidates is not None and args.max_candidates <= 0:
+        parser.error("--max-candidates must be strictly positive")
     return args
+
+
+def _run_backtest_cli(
+    args: argparse.Namespace,
+    settings: StrategySettings,
+    guardian: RiskGuardian | None = None,
+) -> int:
+    """Execute a historical backtest lazily importing src.backtest and log/print metrics."""
+    from src.backtest import BacktestConfig, BacktestEngine, ParquetCandleStore
+
+    raw_tickers = args.tickers if args.tickers is not None else settings.tickers
+    symbols = [ticker.strip().upper() for ticker in raw_tickers if ticker.strip()]
+    store = ParquetCandleStore()
+    market_data = {
+        sym: store.get_or_fetch_candles(sym, period=args.backtest_period)
+        for sym in symbols
+    }
+    vix_series = None
+    try:
+        vix_df = store.get_or_fetch_candles("^VIX", period=args.backtest_period)
+        if vix_df is not None and not vix_df.empty and "Close" in vix_df.columns:
+            vix_series = vix_df["Close"]
+    except Exception as exc:
+        logger.warning("Could not load ^VIX history for backtest (%s); using default VIX", exc)
+
+    config = BacktestConfig(
+        initial_capital=args.initial_capital,
+        atr_stop_multiplier=settings.atr_stop_multiplier,
+        atr_take_profit_multiplier=settings.atr_take_profit_multiplier,
+        max_hold_bars=settings.max_hold_bars,
+        rsi_entry_max=settings.rsi_entry_max,
+        min_relative_volume=settings.min_relative_volume,
+    )
+    engine = BacktestEngine(guardian=guardian or RiskGuardian(), config=config)
+    report = engine.run(market_data=market_data, vix_series=vix_series)
+    metrics = report.metrics
+
+    summary = (
+        "\n=== Backtest Summary ===\n"
+        f"Tickers       : {', '.join(symbols)}\n"
+        f"Period        : {args.backtest_period}\n"
+        f"Total Trades  : {metrics.total_trades}\n"
+        f"Win Rate      : {metrics.win_rate:.2%}\n"
+        f"Profit Factor : {metrics.profit_factor:.2f}\n"
+        f"Max Drawdown  : {metrics.max_drawdown_pct:.2%}\n"
+        f"Total Return  : {metrics.total_return_pct:.2%}\n"
+        f"Initial Capital: ${metrics.initial_capital:,.2f}\n"
+        f"Final Equity  : ${metrics.final_equity:,.2f}\n"
+        f"Compounded PnL: ${metrics.compounded_pnl:,.2f}\n"
+        f"Guardian Vetoes: {report.vetoed_entries_count}\n"
+        "========================"
+    )
+    logger.info("%s", summary)
+    print(summary)
+    return 0
+
+
+def _build_orchestrator_from_settings(
+    db_path: Path,
+    settings: StrategySettings,
+    max_candidates: int,
+) -> TradingBotOrchestrator:
+    """Construct a crash-safe TradingBotOrchestrator configured from StrategySettings."""
+    from src.execution import AlpacaExecutionClient, ExecutionConfig, PositionManager
+
+    audit_store = TradingAuditStore(db_path=db_path)
+    exec_config = ExecutionConfig(
+        trailing_atr_multiplier=settings.trailing_atr_multiplier,
+        take_profit_atr_multiplier=settings.atr_take_profit_multiplier,
+        max_hold_hours=settings.max_hold_hours,
+        min_target_return_pct=settings.min_target_return_pct,
+    )
+    execution_client = AlpacaExecutionClient(audit_store=audit_store, config=exec_config)
+    position_manager = PositionManager(
+        execution_client=execution_client,
+        audit_store=audit_store,
+        config=exec_config,
+    )
+    analyst = GeminiAnalyst(
+        audit_store=audit_store,
+        config=AnalystConfig(min_relative_volume=settings.min_relative_volume),
+    )
+    return TradingBotOrchestrator(
+        analyst=analyst,
+        execution_client=execution_client,
+        position_manager=position_manager,
+        audit_store=audit_store,
+        confirmation_delay_minutes=settings.confirmation_delay_minutes,
+        max_confirmation_delay_minutes=settings.max_confirmation_delay_minutes,
+        default_sector=settings.default_sector,
+        sector_map=settings.sector_map,
+        take_profit_atr_multiplier=settings.atr_take_profit_multiplier,
+        max_candidates_for_ai=max_candidates,
+    )
 
 
 def _log_cycle_summary(report: PipelineCycleReport) -> None:
@@ -745,12 +1067,79 @@ def _log_cycle_summary(report: PipelineCycleReport) -> None:
         )
 
 
+def _run_loop(
+    bot: TradingBotOrchestrator,
+    symbols: list[str],
+    args: argparse.Namespace,
+    sleep_fn: Callable[[float], None],
+) -> int:
+    """Run one or continuous cycles with signal handling and exponential error backoff."""
+    enforce_market_hours = not args.ignore_market_hours
+    stop_requested = False
+
+    def _request_stop(signum: int, _frame: object) -> None:
+        nonlocal stop_requested
+        logger.info("Received signal %s; shutting down gracefully after current step.", signum)
+        stop_requested = True
+
+    prev_sigterm = signal.getsignal(signal.SIGTERM)
+    prev_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+
+    consecutive_errors = 0
+    try:
+        while not stop_requested:
+            run_kwargs: dict[str, Any] = {
+                "symbols": symbols,
+                "dry_run": args.dry_run,
+                "enforce_market_hours": enforce_market_hours,
+            }
+            if args.sync_account:
+                run_kwargs["sync_account"] = True
+
+            try:
+                report = bot.run_cycle(**run_kwargs)
+                _log_cycle_summary(report)
+                consecutive_errors = 0
+                wait_seconds = args.interval_seconds
+            except KeyboardInterrupt:
+                logger.info("Trading bot stopped cleanly by user interrupt.")
+                return 0
+            except Exception as exc:
+                consecutive_errors += 1
+                logger.exception("Cycle error (#%d): %s", consecutive_errors, exc)
+                notifier = getattr(bot, "notifier", None)
+                if notifier is not None and hasattr(notifier, "send_message"):
+                    notifier.send_message(
+                        f"BOT CYCLE ERROR (#{consecutive_errors}): {exc}"
+                    )
+                if not args.loop:
+                    raise
+                wait_seconds = min(
+                    args.interval_seconds * (2 ** min(consecutive_errors - 1, 4)),
+                    300.0,
+                )
+
+            if not args.loop or stop_requested:
+                break
+            sleep_fn(wait_seconds)
+    except KeyboardInterrupt:
+        logger.info("Trading bot stopped cleanly by user interrupt.")
+        return 0
+    finally:
+        signal.signal(signal.SIGTERM, prev_sigterm)
+        signal.signal(signal.SIGINT, prev_sigint)
+
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     orchestrator: TradingBotOrchestrator | None = None,
     sleep_fn: Callable[[float], None] = time_module.sleep,
 ) -> int:
-    """CLI entrypoint loading .env and executing one or continuous trading cycles."""
+    """CLI entrypoint loading .env, private strategy config, and crash-safe runtime loop."""
     load_dotenv()
     if not logging.getLogger().handlers:
         logging.basicConfig(
@@ -759,27 +1148,36 @@ def main(
         )
 
     args = parse_args(argv)
-    bot = orchestrator or TradingBotOrchestrator(
-        audit_store=TradingAuditStore(db_path=args.db_path),
+    settings = load_strategy_settings(args.config)
+    resolved_tickers = [
+        t.strip().upper()
+        for t in (args.tickers if args.tickers is not None else settings.tickers)
+        if t.strip()
+    ]
+    resolved_max_candidates = (
+        args.max_candidates
+        if args.max_candidates is not None
+        else settings.max_candidates_for_ai
     )
-    enforce_market_hours = not args.ignore_market_hours
 
-    try:
-        while True:
-            report = bot.run_cycle(
-                symbols=args.tickers,
-                dry_run=args.dry_run,
-                enforce_market_hours=enforce_market_hours,
-            )
-            _log_cycle_summary(report)
-            if not args.loop:
-                break
-            sleep_fn(args.interval_seconds)
-    except KeyboardInterrupt:
-        logger.info("Trading bot stopped cleanly by user interrupt.")
-        return 0
+    if args.backtest:
+        return _run_backtest_cli(
+            args,
+            settings=settings,
+            guardian=orchestrator.guardian if orchestrator is not None else None,
+        )
 
-    return 0
+    if orchestrator is not None:
+        return _run_loop(orchestrator, resolved_tickers, args, sleep_fn)
+
+    lock_path = args.lock_file or args.db_path.with_suffix(".lock")
+    with ProcessLock(lock_path):
+        bot = _build_orchestrator_from_settings(
+            db_path=args.db_path,
+            settings=settings,
+            max_candidates=resolved_max_candidates,
+        )
+        return _run_loop(bot, resolved_tickers, args, sleep_fn)
 
 
 if __name__ == "__main__":

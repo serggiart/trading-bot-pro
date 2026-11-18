@@ -16,6 +16,7 @@ from src.storage.models import (
     FmpCacheEntry,
     GuardianDecisionRecord,
     OrderRecord,
+    PositionStateRecord,
 )
 
 DEFAULT_DB_PATH = Path("data/trading_audit.db")
@@ -179,6 +180,20 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS idx_orders_status_created
     ON orders (status, created_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS position_state (
+        symbol TEXT PRIMARY KEY,
+        qty REAL NOT NULL,
+        entry_price REAL NOT NULL,
+        current_stop_price REAL NOT NULL,
+        highest_price REAL NOT NULL,
+        atr_14 REAL NOT NULL,
+        opened_at TEXT NOT NULL,
+        stop_order_id TEXT,
+        client_order_id TEXT,
+        updated_at TEXT NOT NULL
+    )
     """,
 )
 
@@ -860,6 +875,126 @@ class TradingAuditStore:
             )
             for row in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Crash-Safe Open Position State
+    # ------------------------------------------------------------------
+
+    def upsert_position_state(
+        self,
+        symbol: str,
+        qty: float,
+        entry_price: float,
+        current_stop_price: float,
+        atr_14: float,
+        opened_at: datetime | None = None,
+        highest_price: float | None = None,
+        stop_order_id: str | None = None,
+        client_order_id: str | None = None,
+        updated_at: datetime | None = None,
+    ) -> PositionStateRecord:
+        """Insert or update crash-safe runtime state for an active open position."""
+        normalized_symbol = _normalize_symbol(symbol)
+        if qty <= 0 or entry_price <= 0 or current_stop_price < 0 or atr_14 < 0:
+            raise ValueError("Invalid numeric values for position_state")
+
+        opened_ny = _ensure_ny_datetime(opened_at)
+        updated_ny = _ensure_ny_datetime(updated_at)
+        peak = float(highest_price) if highest_price is not None else float(entry_price)
+
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO position_state (
+                    symbol,
+                    qty,
+                    entry_price,
+                    current_stop_price,
+                    highest_price,
+                    atr_14,
+                    opened_at,
+                    stop_order_id,
+                    client_order_id,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    qty = excluded.qty,
+                    entry_price = excluded.entry_price,
+                    current_stop_price = excluded.current_stop_price,
+                    highest_price = excluded.highest_price,
+                    atr_14 = excluded.atr_14,
+                    opened_at = excluded.opened_at,
+                    stop_order_id = COALESCE(excluded.stop_order_id, position_state.stop_order_id),
+                    client_order_id = COALESCE(excluded.client_order_id, position_state.client_order_id),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized_symbol,
+                    float(qty),
+                    float(entry_price),
+                    float(current_stop_price),
+                    peak,
+                    float(atr_14),
+                    opened_ny.isoformat(),
+                    stop_order_id,
+                    client_order_id,
+                    updated_ny.isoformat(),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM position_state WHERE symbol = ?",
+                (normalized_symbol,),
+            ).fetchone()
+
+        assert row is not None
+        return self._row_to_position_state(row)
+
+    def get_position_state(self, symbol: str) -> PositionStateRecord | None:
+        """Fetch persisted state for a single open position symbol if present."""
+        normalized_symbol = _normalize_symbol(symbol)
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM position_state WHERE symbol = ?",
+                (normalized_symbol,),
+            ).fetchone()
+        return self._row_to_position_state(row) if row is not None else None
+
+    def get_open_position_states(self) -> list[PositionStateRecord]:
+        """Return all persisted open position states ordered by opened_at ascending."""
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM position_state ORDER BY opened_at ASC, symbol ASC"
+            ).fetchall()
+        return [self._row_to_position_state(row) for row in rows]
+
+    def delete_position_state(self, symbol: str) -> bool:
+        """Remove persisted open position state once closed; return True if deleted."""
+        normalized_symbol = _normalize_symbol(symbol)
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM position_state WHERE symbol = ?",
+                (normalized_symbol,),
+            )
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def _row_to_position_state(row: sqlite3.Row) -> PositionStateRecord:
+        return PositionStateRecord(
+            symbol=str(row["symbol"]),
+            qty=float(row["qty"]),
+            entry_price=float(row["entry_price"]),
+            current_stop_price=float(row["current_stop_price"]),
+            highest_price=float(row["highest_price"]),
+            atr_14=float(row["atr_14"]),
+            opened_at=_parse_ny_datetime(row["opened_at"]),
+            stop_order_id=(
+                str(row["stop_order_id"]) if row["stop_order_id"] is not None else None
+            ),
+            client_order_id=(
+                str(row["client_order_id"]) if row["client_order_id"] is not None else None
+            ),
+            updated_at=_parse_ny_datetime(row["updated_at"]),
+        )
 
 
 AuditDatabase = TradingAuditStore

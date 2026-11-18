@@ -4,20 +4,37 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Mapping
 from dataclasses import replace
+from datetime import datetime
 from typing import Any
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
+    GetOrdersRequest,
     LimitOrderRequest,
     ReplaceOrderRequest,
     StopLossRequest,
     TakeProfitRequest,
 )
 
-from src.execution.models import ExecutionConfig, ExecutionOrderResult, ensure_ny_datetime
+from src.execution.models import (
+    AccountSnapshot,
+    ExecutionConfig,
+    ExecutionOrderResult,
+    ManagedPosition,
+    ensure_ny_datetime,
+)
+from src.guardian import PortfolioPosition
 from src.storage import TradingAuditStore
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    """Safely coerce numeric or string broker fields into float."""
+    if value is None or value == "":
+        return default
+    return float(value)
 
 
 def _resolve_paper_mode(
@@ -278,6 +295,26 @@ class AlpacaExecutionClient:
             broker_order_id=broker_order_id,
             metadata=audit_metadata,
         )
+        if self.audit_store is not None:
+            raw_atr = audit_metadata.get("atr_14")
+            resolved_atr = (
+                float(raw_atr)
+                if isinstance(raw_atr, (int, float)) and raw_atr > 0
+                else max(
+                    0.0,
+                    (limit_price - rounded_stop) / self.config.trailing_atr_multiplier,
+                )
+            )
+            self.audit_store.upsert_position_state(
+                symbol=normalized_symbol,
+                qty=qty,
+                entry_price=limit_price,
+                current_stop_price=rounded_stop,
+                atr_14=resolved_atr,
+                opened_at=ensure_ny_datetime(),
+                highest_price=limit_price,
+                client_order_id=resolved_client_id,
+            )
         return ExecutionOrderResult(
             submitted=True,
             client_order_id=resolved_client_id,
@@ -390,6 +427,8 @@ class AlpacaExecutionClient:
             broker_order_id=broker_order_id,
             metadata=audit_metadata,
         )
+        if self.audit_store is not None:
+            self.audit_store.delete_position_state(normalized_symbol)
         return ExecutionOrderResult(
             submitted=True,
             client_order_id=resolved_client_id,
@@ -426,3 +465,202 @@ class AlpacaExecutionClient:
             order_data=replace_request,
         )
         return True
+
+    def get_account_snapshot(self) -> AccountSnapshot | None:
+        """Fetch live or paper account balances and daily PnL from the broker."""
+        if self._trading_client is None:
+            return None
+
+        account = self._trading_client.get_account()
+        equity = _to_float(getattr(account, "equity", None), default=0.0)
+        cash = _to_float(getattr(account, "cash", None), default=0.0)
+        buying_power = _to_float(getattr(account, "buying_power", None), default=0.0)
+        last_equity = _to_float(getattr(account, "last_equity", None), default=equity)
+        daily_pnl = equity - last_equity
+
+        return AccountSnapshot(
+            equity=equity,
+            cash=cash,
+            buying_power=buying_power,
+            last_equity=last_equity,
+            daily_pnl=daily_pnl,
+        )
+
+    def get_open_positions(
+        self,
+        sector_map: Mapping[str, str] | None = None,
+        default_sector: str = "",
+    ) -> list[PortfolioPosition]:
+        """Fetch open broker positions normalized as PortfolioPosition objects."""
+        if self._trading_client is None:
+            return []
+
+        raw_positions = self._trading_client.get_all_positions() or []
+        normalized_sectors = {
+            k.strip().upper(): v for k, v in (sector_map or {}).items()
+        }
+        positions: list[PortfolioPosition] = []
+        for pos in raw_positions:
+            symbol = str(getattr(pos, "symbol", "") or "").strip().upper()
+            if not symbol:
+                continue
+            shares = _to_float(getattr(pos, "qty", None), default=0.0)
+            market_value = _to_float(getattr(pos, "market_value", None), default=0.0)
+            raw_avg = getattr(pos, "avg_entry_price", None)
+            if raw_avg is None:
+                raw_avg = getattr(pos, "avg_price", None)
+            avg_price = _to_float(raw_avg, default=0.0)
+            sector = normalized_sectors.get(
+                symbol,
+                str(getattr(pos, "sector", "") or default_sector),
+            )
+            positions.append(
+                PortfolioPosition(
+                    symbol=symbol,
+                    sector=sector,
+                    market_value=market_value,
+                    shares=shares,
+                    avg_price=avg_price,
+                )
+            )
+        return positions
+
+    def reconcile_managed_positions(
+        self,
+        atr_lookup: Mapping[str, float] | None = None,
+        now: datetime | None = None,
+    ) -> list[ManagedPosition]:
+        """Reconstruct crash-safe ManagedPositions from broker state and SQLite position_state."""
+        now_ny = ensure_ny_datetime(now)
+        normalized_atr = {
+            k.strip().upper(): float(v)
+            for k, v in (atr_lookup or {}).items()
+            if float(v) > 0.0
+        }
+
+        stored_by_symbol = (
+            {rec.symbol: rec for rec in self.audit_store.get_open_position_states()}
+            if self.audit_store is not None
+            else {}
+        )
+
+        if self._trading_client is None:
+            return [
+                ManagedPosition(
+                    symbol=rec.symbol,
+                    qty=rec.qty,
+                    entry_price=rec.entry_price,
+                    current_stop_price=rec.current_stop_price,
+                    atr_14=normalized_atr.get(rec.symbol, rec.atr_14),
+                    opened_at=rec.opened_at,
+                    highest_price=rec.highest_price,
+                    stop_order_id=rec.stop_order_id,
+                    client_order_id=rec.client_order_id,
+                )
+                for rec in stored_by_symbol.values()
+            ]
+
+        raw_positions = self._trading_client.get_all_positions() or []
+
+        stop_orders_by_symbol: dict[str, tuple[str | None, float]] = {}
+        get_orders_fn = getattr(self._trading_client, "get_orders", None)
+        if callable(get_orders_fn):
+            open_orders = (
+                get_orders_fn(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)) or []
+            )
+            for order in open_orders:
+                sym = str(getattr(order, "symbol", "") or "").strip().upper()
+                if not sym:
+                    continue
+                side_val = str(
+                    getattr(getattr(order, "side", ""), "value", getattr(order, "side", ""))
+                ).lower()
+                type_val = str(
+                    getattr(
+                        getattr(order, "order_type", getattr(order, "type", "")),
+                        "value",
+                        getattr(order, "order_type", getattr(order, "type", "")),
+                    )
+                ).lower()
+                raw_stop = getattr(order, "stop_price", None)
+                if side_val == "sell" and "stop" in type_val and raw_stop is not None:
+                    stop_price = _to_float(raw_stop, default=0.0)
+                    raw_id = getattr(order, "id", None)
+                    stop_id = str(raw_id) if raw_id is not None else None
+                    prev = stop_orders_by_symbol.get(sym)
+                    if prev is None or stop_price > prev[1]:
+                        stop_orders_by_symbol[sym] = (stop_id, stop_price)
+
+        reconciled: list[ManagedPosition] = []
+        active_symbols: set[str] = set()
+
+        for pos in raw_positions:
+            symbol = str(getattr(pos, "symbol", "") or "").strip().upper()
+            if not symbol:
+                continue
+            qty = _to_float(getattr(pos, "qty", None), default=0.0)
+            raw_avg = getattr(pos, "avg_entry_price", None)
+            if raw_avg is None:
+                raw_avg = getattr(pos, "avg_price", None)
+            entry_price = _to_float(raw_avg, default=0.0)
+            if qty <= 0.0 or entry_price <= 0.0:
+                continue
+
+            active_symbols.add(symbol)
+            stored = stored_by_symbol.get(symbol)
+            broker_stop_id, broker_stop_price = stop_orders_by_symbol.get(symbol, (None, 0.0))
+
+            stored_stop = stored.current_stop_price if stored is not None else 0.0
+            current_stop = max(broker_stop_price, stored_stop)
+            atr_14 = normalized_atr.get(
+                symbol,
+                stored.atr_14 if stored is not None and stored.atr_14 > 0.0 else round(entry_price * 0.02, 4),
+            )
+            if current_stop <= 0.0:
+                current_stop = round(
+                    max(0.0, entry_price - atr_14 * self.config.trailing_atr_multiplier),
+                    2,
+                )
+
+            opened_at = stored.opened_at if stored is not None else now_ny
+            highest_price = (
+                max(entry_price, stored.highest_price)
+                if stored is not None
+                else entry_price
+            )
+            stop_order_id = broker_stop_id or (stored.stop_order_id if stored is not None else None)
+            client_order_id = stored.client_order_id if stored is not None else None
+
+            if self.audit_store is not None:
+                self.audit_store.upsert_position_state(
+                    symbol=symbol,
+                    qty=qty,
+                    entry_price=entry_price,
+                    current_stop_price=current_stop,
+                    atr_14=atr_14,
+                    opened_at=opened_at,
+                    highest_price=highest_price,
+                    stop_order_id=stop_order_id,
+                    client_order_id=client_order_id,
+                    updated_at=now_ny,
+                )
+
+            reconciled.append(
+                ManagedPosition(
+                    symbol=symbol,
+                    qty=qty,
+                    entry_price=entry_price,
+                    current_stop_price=current_stop,
+                    atr_14=atr_14,
+                    opened_at=opened_at,
+                    highest_price=highest_price,
+                    stop_order_id=stop_order_id,
+                    client_order_id=client_order_id,
+                )
+            )
+
+        if self.audit_store is not None:
+            for stale_symbol in set(stored_by_symbol.keys()) - active_symbols:
+                self.audit_store.delete_position_state(stale_symbol)
+
+        return reconciled

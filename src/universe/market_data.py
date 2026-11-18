@@ -61,6 +61,57 @@ def calculate_sma(
     return float(np.mean(arr[-period:]))
 
 
+def calculate_ema(
+    closes: Sequence[float] | pd.Series | np.ndarray,
+    period: int = 20,
+) -> float:
+    """Compute the exponential moving average (EMA) over `closes` seeded with SMA."""
+    if period <= 0:
+        raise ValueError("period must be positive")
+    arr = _to_clean_float_array(closes)
+    if len(arr) < period:
+        raise ValueError(f"Insufficient close prices ({len(arr)}) for EMA({period})")
+
+    ema = float(np.mean(arr[:period]))
+    multiplier = 2.0 / (period + 1.0)
+    for price in arr[period:]:
+        ema = float(price) * multiplier + ema * (1.0 - multiplier)
+    return float(ema)
+
+
+def calculate_rsi(
+    closes: Sequence[float] | pd.Series | np.ndarray,
+    period: int = 14,
+) -> float:
+    """Compute Wilder's Relative Strength Index (RSI) safely on zero-loss series."""
+    if period <= 0:
+        raise ValueError("period must be positive")
+    arr = _to_clean_float_array(closes)
+    if len(arr) < period + 1:
+        raise ValueError(f"Insufficient close prices ({len(arr)}) for RSI({period})")
+
+    deltas = np.diff(arr)
+    gains = np.where(deltas > 0.0, deltas, 0.0)
+    losses = np.where(deltas < 0.0, -deltas, 0.0)
+
+    avg_gain = float(np.mean(gains[:period]))
+    avg_loss = float(np.mean(losses[:period]))
+
+    for gain, loss in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + float(gain)) / period
+        avg_loss = (avg_loss * (period - 1) + float(loss)) / period
+
+    if avg_loss == 0.0 and avg_gain == 0.0:
+        return 50.0
+    if avg_loss == 0.0:
+        return 100.0
+    if avg_gain == 0.0:
+        return 0.0
+
+    rs = avg_gain / avg_loss
+    return float(100.0 - (100.0 / (1.0 + rs)))
+
+
 def calculate_atr(
     highs: Sequence[float] | pd.Series | np.ndarray,
     lows: Sequence[float] | pd.Series | np.ndarray,
@@ -230,15 +281,9 @@ class MarketDataClient:
             )
         return self._alpaca_client
 
-    def get_quote(self, symbol: str) -> MarketQuote:
-        """Fetch primary snapshot quote and liquidity metrics via Alpaca IEX feed."""
-        norm_symbol = _normalize_symbol(symbol)
-        client = self._get_alpaca_client()
-        request = StockSnapshotRequest(symbol_or_symbols=norm_symbol, feed=DataFeed.IEX)
-        snapshots = client.get_stock_snapshot(request)
-
-        snapshot = snapshots[norm_symbol] if isinstance(snapshots, dict) else snapshots
-
+    @staticmethod
+    def _parse_snapshot(norm_symbol: str, snapshot: Any) -> MarketQuote:
+        """Convert an Alpaca snapshot object into a normalized MarketQuote."""
         latest_trade = getattr(snapshot, "latest_trade", None)
         latest_quote = getattr(snapshot, "latest_quote", None)
         daily_bar = getattr(snapshot, "daily_bar", None)
@@ -295,6 +340,39 @@ class MarketDataClient:
             timestamp=timestamp,
         )
 
+    def get_quote(self, symbol: str) -> MarketQuote:
+        """Fetch primary snapshot quote and liquidity metrics via Alpaca IEX feed."""
+        norm_symbol = _normalize_symbol(symbol)
+        client = self._get_alpaca_client()
+        request = StockSnapshotRequest(symbol_or_symbols=norm_symbol, feed=DataFeed.IEX)
+        snapshots = client.get_stock_snapshot(request)
+
+        snapshot = snapshots[norm_symbol] if isinstance(snapshots, dict) else snapshots
+        return self._parse_snapshot(norm_symbol, snapshot)
+
+    def get_quotes_batch(self, symbols: Sequence[str]) -> dict[str, MarketQuote]:
+        """Fetch snapshot quotes for multiple symbols in a single Alpaca IEX request."""
+        norm_symbols = list(dict.fromkeys(_normalize_symbol(symbol) for symbol in symbols))
+        if not norm_symbols:
+            return {}
+
+        client = self._get_alpaca_client()
+        request = StockSnapshotRequest(symbol_or_symbols=norm_symbols, feed=DataFeed.IEX)
+        snapshots = client.get_stock_snapshot(request)
+
+        if not isinstance(snapshots, dict):
+            if len(norm_symbols) == 1 and snapshots is not None:
+                sym = norm_symbols[0]
+                return {sym: self._parse_snapshot(sym, snapshots)}
+            return {}
+
+        quotes: dict[str, MarketQuote] = {}
+        for sym in norm_symbols:
+            snap = snapshots.get(sym)
+            if snap is not None:
+                quotes[sym] = self._parse_snapshot(sym, snap)
+        return quotes
+
     def get_historical_ohlcv(self, symbol: str, period: str = "1y") -> pd.DataFrame:
         """Fetch historical OHLCV bars from yfinance."""
         norm_symbol = _normalize_symbol(symbol)
@@ -334,6 +412,9 @@ class MarketDataClient:
         current_price = float(closes.iloc[-1])
         sma_200 = calculate_sma(closes, period=sma_period)
         atr_14 = calculate_atr(highs, lows, closes, period=atr_period)
+        clean_closes = _to_clean_float_array(closes)
+        ema_20 = calculate_ema(clean_closes, period=20) if len(clean_closes) >= 20 else current_price
+        rsi_14 = calculate_rsi(clean_closes, period=14) if len(clean_closes) >= 15 else 50.0
         resolved_vix = float(vix) if vix is not None else self.get_vix()
 
         latest_volume = 0.0
@@ -355,6 +436,8 @@ class MarketDataClient:
             vix=resolved_vix,
             latest_volume=latest_volume,
             avg_volume_20d=avg_volume_20d,
+            ema_20=ema_20,
+            rsi_14=rsi_14,
         )
 
     def validate_price(

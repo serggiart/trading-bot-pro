@@ -1,0 +1,20 @@
+{
+  "tickers": ["AAPL", "MSFT", "NVDA"],
+  "max_candidates_for_ai": 5,
+  "atr_stop_multiplier": 2.0,
+  "atr_take_profit_multiplier": 2.0,
+  "trailing_atr_multiplier": 2.0,
+  "max_hold_bars": 10,
+  "max_hold_hours": 72.0,
+  "min_target_return_pct": 0.01,
+  "rsi_entry_max": 60.0,
+  "min_relative_volume": 1.2,
+  "confirmation_delay_minutes": 2.0,
+  "max_confirmation_delay_minutes": 5.0,
+  "default_sector": "Technology",
+  "sector_map": {
+    "AAPL": "Technology",
+    "MSFT": "Technology",
+    "NVDA": "Technology"
+  }
+}

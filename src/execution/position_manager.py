@@ -313,6 +313,19 @@ class PositionManager:
                     dry_run=dry_run,
                 )
             position.current_stop_price = new_stop
+            if not dry_run and self.audit_store is not None:
+                self.audit_store.upsert_position_state(
+                    symbol=position.symbol,
+                    qty=position.qty,
+                    entry_price=position.entry_price,
+                    current_stop_price=new_stop,
+                    atr_14=position.atr_14,
+                    opened_at=opened_ny,
+                    highest_price=peak,
+                    stop_order_id=position.stop_order_id,
+                    client_order_id=position.client_order_id,
+                    updated_at=eval_now,
+                )
             return ExitEvaluationResult(
                 symbol=position.symbol,
                 action="TRAIL_UPDATE",

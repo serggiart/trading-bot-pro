@@ -14,6 +14,7 @@ from alpaca.trading.requests import LimitOrderRequest, ReplaceOrderRequest
 
 from src.execution import (
     NY_TIMEZONE,
+    AccountSnapshot,
     AlpacaExecutionClient,
     ExecutionConfig,
     ManagedPosition,
@@ -24,6 +25,7 @@ from src.execution import (
     is_flash_crash_triggered,
     is_time_window_expired,
 )
+from src.guardian import PortfolioPosition
 from src.storage import TradingAuditStore
 
 
@@ -290,7 +292,11 @@ def test_compute_trailing_stop_ratchet_invariant() -> None:
 def test_position_manager_trailing_ratchet_and_stop_exit(tmp_path: Path) -> None:
     store = TradingAuditStore(db_path=tmp_path / "audit.db")
     mock_broker = _make_mock_trading_client(order_id="sell-stop-1")
-    client = AlpacaExecutionClient(audit_store=store, trading_client=mock_broker)
+    client = AlpacaExecutionClient(
+        audit_store=store,
+        trading_client=mock_broker,
+        config=ExecutionConfig(trailing_atr_multiplier=2.0),
+    )
     manager = PositionManager(execution_client=client, audit_store=store)
 
     opened_at = datetime(2026, 5, 1, 10, 0, tzinfo=NY_TIMEZONE)
@@ -357,7 +363,11 @@ def test_position_manager_trailing_ratchet_and_stop_exit(tmp_path: Path) -> None
 def test_flash_crash_triggers_within_5_minutes_and_logs_anomaly(tmp_path: Path) -> None:
     store = TradingAuditStore(db_path=tmp_path / "audit.db")
     mock_broker = _make_mock_trading_client(order_id="emg-sell-1")
-    client = AlpacaExecutionClient(audit_store=store, trading_client=mock_broker)
+    client = AlpacaExecutionClient(
+        audit_store=store,
+        trading_client=mock_broker,
+        config=ExecutionConfig(trailing_atr_multiplier=2.0),
+    )
     manager = PositionManager(execution_client=client, audit_store=store)
 
     opened_at = datetime(2026, 5, 1, 9, 35, tzinfo=NY_TIMEZONE)
@@ -486,7 +496,11 @@ def test_time_window_exit_closes_stagnant_and_holds_profitable(tmp_path: Path) -
 
     store = TradingAuditStore(db_path=tmp_path / "audit.db")
     mock_broker = _make_mock_trading_client(order_id="time-sell-1")
-    client = AlpacaExecutionClient(audit_store=store, trading_client=mock_broker)
+    client = AlpacaExecutionClient(
+        audit_store=store,
+        trading_client=mock_broker,
+        config=ExecutionConfig(trailing_atr_multiplier=2.0),
+    )
     manager = PositionManager(execution_client=client, audit_store=store)
 
     stagnant_pos = ManagedPosition(
@@ -524,3 +538,131 @@ def test_time_window_exit_closes_stagnant_and_holds_profitable(tmp_path: Path) -
     assert res_hold.action == "HOLD"
     assert res_hold.should_exit is False
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. Broker Account Snapshot & Open Positions Sync
+# ---------------------------------------------------------------------------
+
+
+def test_get_account_snapshot_and_open_positions_offline_and_mocked() -> None:
+    offline_client = AlpacaExecutionClient()
+    assert offline_client.get_account_snapshot() is None
+    assert offline_client.get_open_positions() == []
+
+    mock_broker = _make_mock_trading_client()
+    mock_broker.get_account.return_value = SimpleNamespace(
+        equity="10525.50",
+        cash="4200.00",
+        buying_power="14725.50",
+        last_equity="10000.00",
+    )
+    mock_broker.get_all_positions.return_value = [
+        SimpleNamespace(
+            symbol="aapl",
+            qty="10",
+            market_value="2000.00",
+            avg_entry_price="195.00",
+        ),
+        SimpleNamespace(
+            symbol="MSFT",
+            qty="5",
+            market_value="2100.00",
+            avg_entry_price="410.00",
+        ),
+    ]
+
+    client = AlpacaExecutionClient(trading_client=mock_broker)
+    snapshot = client.get_account_snapshot()
+    assert isinstance(snapshot, AccountSnapshot)
+    assert snapshot.equity == pytest.approx(10525.50)
+    assert snapshot.cash == pytest.approx(4200.00)
+    assert snapshot.buying_power == pytest.approx(14725.50)
+    assert snapshot.last_equity == pytest.approx(10000.00)
+    assert snapshot.daily_pnl == pytest.approx(525.50)
+
+    positions = client.get_open_positions(sector_map={"AAPL": "Technology"}, default_sector="Equities")
+    assert len(positions) == 2
+    assert all(isinstance(p, PortfolioPosition) for p in positions)
+    assert positions[0].symbol == "AAPL"
+    assert positions[0].sector == "Technology"
+    assert positions[0].shares == pytest.approx(10.0)
+    assert positions[0].market_value == pytest.approx(2000.0)
+    assert positions[0].avg_price == pytest.approx(195.0)
+    assert positions[1].symbol == "MSFT"
+    assert positions[1].sector == "Equities"
+
+    cfg = ExecutionConfig()
+    assert cfg.take_profit_atr_multiplier == pytest.approx(2.0)
+    assert cfg.trailing_atr_multiplier == pytest.approx(2.0)
+    with pytest.raises(ValueError, match="take_profit_atr_multiplier"):
+        ExecutionConfig(take_profit_atr_multiplier=-0.5)
+
+
+def test_crash_safe_position_reconciliation_from_broker_and_sqlite(tmp_path: Path) -> None:
+    store = TradingAuditStore(tmp_path / "reconcile.db")
+    opened_at = datetime(2026, 11, 18, 10, 0, tzinfo=NY_TIMEZONE)
+
+    # Simulate persisted trailing-stop high-watermark + stale closed symbol before crash
+    store.upsert_position_state(
+        symbol="AAPL",
+        qty=10.0,
+        entry_price=200.0,
+        current_stop_price=203.50,
+        atr_14=2.5,
+        opened_at=opened_at,
+        highest_price=208.50,
+        stop_order_id="stop-aapl-1",
+        client_order_id="buy-aapl-1",
+    )
+    store.upsert_position_state(
+        symbol="STALE",
+        qty=5.0,
+        entry_price=50.0,
+        current_stop_price=48.0,
+        atr_14=1.0,
+        opened_at=opened_at,
+    )
+
+    mock_broker = MagicMock()
+    mock_broker.get_all_positions.return_value = [
+        SimpleNamespace(symbol="AAPL", qty="10", avg_entry_price="200.00"),
+        SimpleNamespace(symbol="MSFT", qty="4", avg_entry_price="400.00"),
+    ]
+    mock_broker.get_orders.return_value = [
+        SimpleNamespace(
+            id="stop-aapl-1",
+            symbol="AAPL",
+            side="sell",
+            order_type="stop",
+            stop_price="202.00",
+        ),
+        SimpleNamespace(
+            id="stop-msft-1",
+            symbol="MSFT",
+            side="sell",
+            order_type="stop",
+            stop_price="392.00",
+        ),
+    ]
+
+    client = AlpacaExecutionClient(audit_store=store, trading_client=mock_broker)
+    now_ny = opened_at + timedelta(hours=4)
+    reconciled = client.reconcile_managed_positions(atr_lookup={"MSFT": 4.0}, now=now_ny)
+
+    assert [p.symbol for p in reconciled] == ["AAPL", "MSFT"]
+    aapl_pos, msft_pos = reconciled
+    # Preserves higher persisted trailing stop (203.50 > broker 202.00) and original opened_at
+    assert aapl_pos.current_stop_price == pytest.approx(203.50)
+    assert aapl_pos.highest_price == pytest.approx(208.50)
+    assert aapl_pos.opened_at == opened_at
+    assert aapl_pos.stop_order_id == "stop-aapl-1"
+
+    # Reconstructs MSFT from broker stop order + atr_lookup
+    assert msft_pos.current_stop_price == pytest.approx(392.00)
+    assert msft_pos.atr_14 == pytest.approx(4.0)
+    assert msft_pos.stop_order_id == "stop-msft-1"
+
+    # Stale closed symbol was purged from SQLite position_state
+    assert store.get_position_state("STALE") is None
+    assert store.get_position_state("MSFT") is not None
