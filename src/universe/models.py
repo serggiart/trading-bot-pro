@@ -14,6 +14,7 @@ class UniverseConfig:
     """Deterministic screening thresholds for liquidity, fundamentals, and trend."""
 
     min_avg_volume: float = 500_000.0
+    min_iex_volume: float = 150_000.0
     max_spread_pct: float = 0.005
     max_debt_to_equity: float = 2.0
     min_free_cash_flow: float = 0.0

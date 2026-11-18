@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable
 from datetime import date, datetime
 from typing import Any
@@ -19,6 +20,11 @@ class FmpRateLimitError(RuntimeError):
 
 class FmpApiError(RuntimeError):
     """Raised when FMP returns an unexpected or incomplete response."""
+
+
+def _sanitize_error_message(message: str) -> str:
+    """Redact API keys from URLs or HTTP error strings before logging/raising."""
+    return re.sub(r"([?&]apikey=)[^&\s'\"]+", r"\1***", message)
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -150,7 +156,10 @@ class FmpClient:
 
         response = self._http_get(url, params=query_params, timeout=self.timeout)
         self.store.record_fmp_request(endpoint=endpoint_name, symbol=symbol, now=now)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            raise FmpApiError(_sanitize_error_message(str(exc))) from None
         return response.json()
 
     def get_fundamentals(

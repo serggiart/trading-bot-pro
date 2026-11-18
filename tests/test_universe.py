@@ -373,6 +373,20 @@ def test_fmp_raises_api_error_on_empty_payload(tmp_path: Path) -> None:
         with pytest.raises(FmpApiError):
             fmp.get_fundamentals("BAD", now=now)
 
+        secret_resp = MagicMock()
+        secret_resp.raise_for_status.side_effect = RuntimeError(
+            "402 Client Error: Payment Required for url: https://financialmodelingprep.com/stable/ratios?apikey=SUPERSECRET123&symbol=BAD"
+        )
+        fmp_err = FmpClient(
+            store=store,
+            api_key="SUPERSECRET123",
+            http_get=MagicMock(return_value=secret_resp),
+        )
+        with pytest.raises(FmpApiError) as exc_info:
+            fmp_err.get_fundamentals("BAD2", now=now)
+        assert "SUPERSECRET123" not in str(exc_info.value)
+        assert "apikey=***" in str(exc_info.value)
+
 
 # ------------------------------------------------------------------
 # UniverseScreener Full Integration Tests
@@ -644,3 +658,14 @@ def test_compute_return_correlation_matrix_and_zero_std_safety() -> None:
     assert matrix[("AAPL", "MSFT")] > 0.90
     assert matrix[("AAPL", "SH")] < -0.90
     assert ("AAPL", "FLAT") not in matrix
+
+
+def test_universe_screener_dual_iex_and_consolidated_liquidity(tmp_path: Path) -> None:
+    now = datetime(2026, 11, 18, 10, 30, tzinfo=NY_TIMEZONE)
+    # 250K on IEX (>= 150K min_iex_volume) with 1M consolidated 20d avg (>= 500K) passes
+    screener, store, _, _ = _build_screener(tmp_path, volume=250_000.0)
+    try:
+        res = screener.screen_symbol("AAPL", now=now)
+        assert res.passed is True
+    finally:
+        store.close()

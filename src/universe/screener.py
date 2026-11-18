@@ -117,9 +117,14 @@ class UniverseScreener:
                 f"Excessive bid/ask spread: {quote.spread_pct:.4%} > {self.config.max_spread_pct:.4%}"
             )
 
-        if quote.volume < self.config.min_avg_volume:
+        avg_vol_20d = float(getattr(indicators, "avg_volume_20d", 0.0) or 0.0)
+        if quote.volume < self.config.min_iex_volume:
             rejection_reasons.append(
-                f"Insufficient liquidity volume: {quote.volume:,.0f} < {self.config.min_avg_volume:,.0f}"
+                f"Insufficient liquidity volume (IEX): {quote.volume:,.0f} < {self.config.min_iex_volume:,.0f}"
+            )
+        elif avg_vol_20d > 0.0 and avg_vol_20d < self.config.min_avg_volume:
+            rejection_reasons.append(
+                f"Insufficient liquidity volume (20d avg): {avg_vol_20d:,.0f} < {self.config.min_avg_volume:,.0f}"
             )
 
         if fundamentals.free_cash_flow <= self.config.min_free_cash_flow:
