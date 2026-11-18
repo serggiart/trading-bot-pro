@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from alpaca.data.models.news import NewsSet
 from alpaca.data.requests import NewsRequest
-from google.genai import types
+from google.genai import errors as genai_errors, types
 from pydantic import ValidationError
 
 from src.analyst import (
@@ -95,6 +95,8 @@ def test_analyst_report_valid_boundaries_and_ticker_normalization() -> None:
     assert report_high.ticker == "NVDA"
     assert report_high.sentiment_score == 1.0
     assert report_high.confidence_score == 1.0
+    # Gemini v1 rejects additionalProperties/additional_properties in response_schema
+    assert "additionalProperties" not in AnalystReport.model_json_schema()
 
 
 @pytest.mark.parametrize(
@@ -337,12 +339,16 @@ def test_gemini_analyst_call_verification_and_approved_persistence(
     # Verify google-genai invocation signature and config
     mock_client.models.generate_content.assert_called_once()
     call_kwargs = mock_client.models.generate_content.call_args.kwargs
-    assert call_kwargs["model"] == "gemini-2.5-flash"
+    assert call_kwargs["model"] == "gemini-4-hydrogen"
     gen_config = call_kwargs["config"]
     assert isinstance(gen_config, types.GenerateContentConfig)
     assert gen_config.response_mime_type == "application/json"
     assert gen_config.response_schema is AnalystReport
     assert gen_config.temperature == pytest.approx(0.1)
+    assert gen_config.http_options is not None
+    assert gen_config.http_options.timeout == 20_000
+    assert gen_config.http_options.retry_options is not None
+    assert gen_config.http_options.retry_options.attempts == 1
 
     # Verify SQLite persistence in tmp_path DB
     records = store.get_ai_signals(symbol="AAPL")
@@ -485,3 +491,55 @@ def test_gemini_analyst_collects_multiple_rejection_reasons_and_uses_env_key(
     assert len(records) == 1
     assert records[0].sentiment == "neutral"
     assert records[0].passed_threshold is False
+
+
+def test_gemini_analyst_falls_back_on_503_or_404_and_raises_on_400(
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    store = TradingAuditStore(tmp_path / "fallback.db")
+    ok_report = _make_report(ticker="AAPL", confidence_score=0.82)
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = [
+        genai_errors.ServerError(503, {"error": {"message": "overloaded"}}),
+        SimpleNamespace(parsed=ok_report),
+    ]
+
+    analyst = GeminiAnalyst(
+        audit_store=store,
+        news_aggregator=MagicMock(spec=NewsAggregator),
+        client=mock_client,
+        config=AnalystConfig(
+            model_name="gemini-4-hydrogen",
+            fallback_models=("gemini-3.5-flash-lite",),
+        ),
+    )
+    result = analyst.evaluate(
+        symbol="AAPL",
+        current_volume=2_000_000,
+        avg_volume_20d=1_000_000,
+        news_items=_make_sample_news(),
+    )
+    assert result.approved is True
+    called_models = [
+        call.kwargs["model"] for call in mock_client.models.generate_content.call_args_list
+    ]
+    assert called_models == ["gemini-4-hydrogen", "gemini-3.5-flash-lite"]
+
+    # Non-retryable 400 error must surface immediately without trying fallbacks
+    mock_client_400 = MagicMock()
+    mock_client_400.models.generate_content.side_effect = genai_errors.ClientError(
+        400, {"error": {"message": "bad payload"}}
+    )
+    analyst_400 = GeminiAnalyst(
+        audit_store=store,
+        news_aggregator=MagicMock(spec=NewsAggregator),
+        client=mock_client_400,
+    )
+    with pytest.raises(genai_errors.ClientError):
+        analyst_400.evaluate(
+            symbol="AAPL",
+            current_volume=2_000_000,
+            avg_volume_20d=1_000_000,
+            news_items=_make_sample_news(),
+        )
+    assert mock_client_400.models.generate_content.call_count == 1

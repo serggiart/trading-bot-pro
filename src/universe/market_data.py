@@ -109,6 +109,24 @@ def calculate_atr(
     return float(atr)
 
 
+def calculate_avg_volume(
+    volumes: Sequence[float] | pd.Series | np.ndarray,
+    period: int = 20,
+    exclude_latest: bool = True,
+) -> float:
+    """Compute trailing average trading volume over `period` completed sessions."""
+    if period <= 0:
+        raise ValueError("period must be positive")
+    arr = _to_clean_float_array(volumes)
+    if len(arr) == 0:
+        return 0.0
+    window = arr[:-1] if (exclude_latest and len(arr) > 1) else arr
+    if len(window) == 0:
+        return 0.0
+    sample = window[-period:] if len(window) >= period else window
+    return float(np.mean(sample))
+
+
 def validate_cross_price(
     symbol: str,
     alpaca_price: float,
@@ -318,6 +336,16 @@ class MarketDataClient:
         atr_14 = calculate_atr(highs, lows, closes, period=atr_period)
         resolved_vix = float(vix) if vix is not None else self.get_vix()
 
+        latest_volume = 0.0
+        avg_volume_20d = 0.0
+        try:
+            volumes = _extract_column(df, "Volume")
+            if not volumes.empty:
+                latest_volume = float(volumes.iloc[-1])
+                avg_volume_20d = calculate_avg_volume(volumes, period=20, exclude_latest=True)
+        except KeyError:
+            pass
+
         return TechnicalIndicators(
             symbol=norm_symbol,
             current_price=current_price,
@@ -325,6 +353,8 @@ class MarketDataClient:
             atr_14=atr_14,
             above_sma_200=current_price > sma_200,
             vix=resolved_vix,
+            latest_volume=latest_volume,
+            avg_volume_20d=avg_volume_20d,
         )
 
     def validate_price(

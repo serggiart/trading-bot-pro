@@ -850,3 +850,47 @@ def test_pipeline_with_real_execution_client_and_position_manager_dry_run() -> N
     # Verify both orders (emergency sell + dry-run buy) were audited in SQLite
     orders = store.get_orders()
     assert len(orders) == 2
+
+
+def test_intraday_run_rate_volume_projection_used_by_orchestrator() -> None:
+    from main import estimate_intraday_run_rate_volume
+
+    # At 12:45 ET (195 min into 390-min session = 50% elapsed), 30M volume projects to 60M
+    midday_ny = datetime(2026, 11, 18, 12, 45, 0, tzinfo=NY_TIMEZONE)
+    assert estimate_intraday_run_rate_volume(30_000_000.0, now=midday_ny) == pytest.approx(60_000_000.0)
+
+    # Off-hours returns raw volume without scaling
+    after_hours = datetime(2026, 11, 18, 18, 0, 0, tzinfo=NY_TIMEZONE)
+    assert estimate_intraday_run_rate_volume(30_000_000.0, now=after_hours) == pytest.approx(30_000_000.0)
+
+    screening = _make_screening_result("AAPL", vix=18.5)
+    screening = UniverseScreeningResult(
+        symbol="AAPL",
+        passed=True,
+        rejection_reasons=[],
+        quote=screening.quote,
+        validation=screening.validation,
+        indicators=TechnicalIndicators(
+            symbol="AAPL",
+            current_price=200.0,
+            sma_200=180.0,
+            atr_14=3.0,
+            above_sma_200=True,
+            vix=18.5,
+            latest_volume=30_000_000.0,
+            avg_volume_20d=40_000_000.0,
+        ),
+        fundamentals=screening.fundamentals,
+    )
+    store = TradingAuditStore(":memory:")
+    orchestrator, mocks = _build_mock_orchestrator(
+        audit_store=store,
+        screening_result=screening,
+        news_items=[_make_news(midday_ny - timedelta(minutes=5))],
+        analyst_result=_make_analyst_result("AAPL", approved=True),
+    )
+
+    orchestrator.run_cycle(symbols=["AAPL"], now=midday_ny, dry_run=True)
+    eval_kwargs = mocks["analyst"].evaluate.call_args.kwargs
+    assert eval_kwargs["current_volume"] == pytest.approx(60_000_000.0)
+    assert eval_kwargs["avg_volume_20d"] == pytest.approx(40_000_000.0)

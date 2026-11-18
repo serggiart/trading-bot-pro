@@ -4,6 +4,7 @@ from src.universe.fmp import FmpApiError, FmpClient, FmpRateLimitError
 from src.universe.market_data import (
     MarketDataClient,
     calculate_atr,
+    calculate_avg_volume,
     calculate_sma,
     validate_cross_price,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "UniverseScreener",
     "UniverseScreeningResult",
     "calculate_atr",
+    "calculate_avg_volume",
     "calculate_sma",
     "validate_cross_price",
 ]

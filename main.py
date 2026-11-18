@@ -69,6 +69,23 @@ def is_market_open(now: datetime | None = None) -> bool:
     return MARKET_OPEN_TIME <= current_time < MARKET_CLOSE_TIME
 
 
+def estimate_intraday_run_rate_volume(
+    latest_volume: float,
+    now: datetime | None = None,
+    min_session_fraction: float = 0.05,
+) -> float:
+    """Scale cumulative intraday volume to an estimated full-day run-rate during NY hours."""
+    if latest_volume <= 0.0:
+        return 0.0
+    ny_now = normalize_ny_datetime(now)
+    if not is_market_open(ny_now):
+        return float(latest_volume)
+    market_open_dt = datetime.combine(ny_now.date(), MARKET_OPEN_TIME, tzinfo=NY_TIMEZONE)
+    elapsed_minutes = (ny_now - market_open_dt).total_seconds() / 60.0
+    session_fraction = max(elapsed_minutes / 390.0, min_session_fraction)
+    return float(latest_volume) / min(session_fraction, 1.0)
+
+
 def check_news_confirmation_window(
     news_items: Sequence[NewsItem],
     now: datetime | None = None,
@@ -379,14 +396,22 @@ class TradingBotOrchestrator:
             if quote is not None and quote.ask_price > 0.0
             else entry_price
         )
-        cur_vol = current_volumes.get(
-            symbol,
-            quote.volume if quote is not None else 0.0,
-        )
-        avg_vol = avg_volumes_20d.get(
-            symbol,
-            quote.volume if quote is not None and quote.volume > 0.0 else cur_vol,
-        )
+        ind_latest_vol = float(getattr(indicators, "latest_volume", 0.0) or 0.0)
+        ind_avg_vol_20d = float(getattr(indicators, "avg_volume_20d", 0.0) or 0.0)
+
+        if symbol in current_volumes:
+            cur_vol = current_volumes[symbol]
+        elif ind_latest_vol > 0.0 and ind_avg_vol_20d > 0.0:
+            cur_vol = estimate_intraday_run_rate_volume(ind_latest_vol, now=now_ny)
+        else:
+            cur_vol = quote.volume if quote is not None else 0.0
+
+        if symbol in avg_volumes_20d:
+            avg_vol = avg_volumes_20d[symbol]
+        elif ind_avg_vol_20d > 0.0:
+            avg_vol = ind_avg_vol_20d
+        else:
+            avg_vol = quote.volume if quote is not None and quote.volume > 0.0 else cur_vol
 
         # Stage 2: News aggregation & 2-5 minute confirmation window
         analyst_config = getattr(self.analyst, "config", None)

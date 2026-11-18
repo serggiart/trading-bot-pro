@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 NY_TIMEZONE = ZoneInfo("America/New_York")
 
@@ -47,7 +47,9 @@ def _validate_finite_float(value: float, field_name: str) -> float:
 class AnalystReport(BaseModel):
     """Structured output schema returned by the Gemini AI Analyst."""
 
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    # Avoid extra="forbid" here because Pydantic emits "additionalProperties": false,
+    # which Gemini v1 generation_config.response_schema rejects with 400 INVALID_ARGUMENT.
+    model_config = ConfigDict(str_strip_whitespace=True)
 
     ticker: str = Field(..., min_length=1)
     sentiment_score: float = Field(..., ge=-1.0, le=1.0)
@@ -56,6 +58,15 @@ class AnalystReport(BaseModel):
     volume_confirmed: bool
     manipulation_risk: bool
     rationale: str = Field(..., min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_unexpected_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            unexpected = set(data.keys()) - set(cls.model_fields.keys())
+            if unexpected:
+                raise ValueError(f"Unexpected fields not permitted: {sorted(unexpected)}")
+        return data
 
     @field_validator("ticker")
     @classmethod
@@ -98,7 +109,12 @@ class AnalystConfig(BaseModel):
     min_confidence: float = Field(default=0.70, ge=0.0, le=1.0)
     min_independent_sources: int = Field(default=3, ge=1)
     min_relative_volume: float = Field(default=1.2, ge=0.0)
-    model_name: str = Field(default="gemini-2.5-flash", min_length=1)
+    model_name: str = Field(default="gemini-4-hydrogen", min_length=1)
+    fallback_models: tuple[str, ...] = Field(
+        default=("gemini-3.5-flash-lite", "gemini-3.8-flash")
+    )
+    request_timeout_ms: int = Field(default=20_000, ge=1000)
+    retry_attempts: int = Field(default=1, ge=1)
     lookback_hours: int = Field(default=48, ge=1)
 
     @field_validator("min_confidence", "min_relative_volume")

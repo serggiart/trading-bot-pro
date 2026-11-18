@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from collections.abc import Sequence
@@ -9,6 +10,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from src.analyst.models import (
@@ -19,6 +21,9 @@ from src.analyst.models import (
 )
 from src.analyst.news import NewsAggregator
 from src.storage import TradingAuditStore
+
+logger = logging.getLogger(__name__)
+_RETRYABLE_MODEL_STATUS_CODES = frozenset({404, 429, 503})
 
 
 def compute_relative_volume(current_volume: float, avg_volume_20d: float) -> float:
@@ -202,15 +207,45 @@ class GeminiAnalyst:
         )
 
         client = self._get_client()
-        response = client.models.generate_content(
-            model=self.config.model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=AnalystReport,
-                temperature=0.1,
+        gen_config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=AnalystReport,
+            temperature=0.1,
+            http_options=types.HttpOptions(
+                timeout=self.config.request_timeout_ms,
+                retry_options=types.HttpRetryOptions(attempts=self.config.retry_attempts),
             ),
         )
+        candidate_models = list(
+            dict.fromkeys([self.config.model_name, *self.config.fallback_models])
+        )
+        response: Any = None
+        last_exc: Exception | None = None
+        for idx, model_id in enumerate(candidate_models):
+            try:
+                response = client.models.generate_content(
+                    model=model_id,
+                    contents=prompt,
+                    config=gen_config,
+                )
+                break
+            except genai_errors.APIError as exc:
+                status_code = getattr(exc, "code", None)
+                if (
+                    status_code in _RETRYABLE_MODEL_STATUS_CODES
+                    and idx < len(candidate_models) - 1
+                ):
+                    logger.warning(
+                        "Gemini model %s returned %s; falling back to %s",
+                        model_id,
+                        status_code,
+                        candidate_models[idx + 1],
+                    )
+                    last_exc = exc
+                    continue
+                raise
+        if response is None and last_exc is not None:
+            raise last_exc
         report = _parse_analyst_report(response)
 
         rejection_reasons = evaluate_report_gates(

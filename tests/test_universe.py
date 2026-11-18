@@ -22,6 +22,7 @@ from src.universe import (
     UniverseConfig,
     UniverseScreener,
     calculate_atr,
+    calculate_avg_volume,
     calculate_sma,
     validate_cross_price,
 )
@@ -264,6 +265,10 @@ def test_market_data_client_yfinance_indicators_and_vix() -> None:
     assert indicators.atr_14 == pytest.approx(2.0)
     assert indicators.above_sma_200 is True
     assert indicators.vix == pytest.approx(18.25)
+    assert indicators.latest_volume == pytest.approx(1_000_000.0)
+    assert indicators.avg_volume_20d == pytest.approx(1_000_000.0)
+    assert calculate_avg_volume([100.0] * 20 + [500.0], period=20, exclude_latest=True) == pytest.approx(100.0)
+    assert calculate_avg_volume([], period=20) == 0.0
 
 
 # ------------------------------------------------------------------

@@ -54,7 +54,7 @@ class PriceValidationResult:
 
 @dataclass(frozen=True, slots=True)
 class TechnicalIndicators:
-    """Trend, volatility, and macro regime indicators for a ticker."""
+    """Trend, volatility, volume baseline, and macro regime indicators for a ticker."""
 
     symbol: str
     current_price: float
@@ -62,6 +62,8 @@ class TechnicalIndicators:
     atr_14: float
     above_sma_200: bool
     vix: float
+    latest_volume: float = 0.0
+    avg_volume_20d: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
