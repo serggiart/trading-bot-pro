@@ -833,6 +833,7 @@ class TradingBotOrchestrator:
 
         pre_screened_map: dict[str, UniverseScreeningResult] = {}
         pre_screen_errors: dict[str, str] = {}
+        prefiltered_volume_reasons: dict[str, str] = {}
         selected_symbols: set[str] | None = None
 
         if len(cleaned_symbols) > 1 and self.max_candidates_for_ai > 0:
@@ -853,8 +854,42 @@ class TradingBotOrchestrator:
                     logger.exception("Error pre-screening symbol %s: %s", symbol, exc)
                     pre_screen_errors[symbol] = str(exc)
 
+            ranking_pool = list(pre_screened_map.values())
+            analyst_cfg = getattr(self.analyst, "config", None)
+            if self.skip_ai_on_prefilter_fail and isinstance(analyst_cfg, AnalystConfig):
+                filtered_pool: list[UniverseScreeningResult] = []
+                for res in ranking_pool:
+                    if not res.passed:
+                        filtered_pool.append(res)
+                        continue
+                    ind = res.indicators
+                    quote = res.quote
+                    ind_latest = float(getattr(ind, "latest_volume", 0.0) or 0.0) if ind else 0.0
+                    ind_avg = float(getattr(ind, "avg_volume_20d", 0.0) or 0.0) if ind else 0.0
+                    if res.symbol in normalized_cur_vols:
+                        cv = normalized_cur_vols[res.symbol]
+                    elif ind_latest > 0.0 and ind_avg > 0.0:
+                        cv = estimate_intraday_run_rate_volume(ind_latest, now=now_ny)
+                    else:
+                        cv = quote.volume if quote is not None else 0.0
+                    if res.symbol in normalized_avg_vols:
+                        av = normalized_avg_vols[res.symbol]
+                    elif ind_avg > 0.0:
+                        av = ind_avg
+                    else:
+                        av = quote.volume if quote is not None and quote.volume > 0.0 else cv
+                    rel_vol = compute_relative_volume(cv, av)
+                    if rel_vol < analyst_cfg.min_relative_volume:
+                        prefiltered_volume_reasons[res.symbol] = (
+                            f"relative_volume {rel_vol:.2f} < {analyst_cfg.min_relative_volume:.2f} "
+                            "(price-volume divergence; skipped LLM call)"
+                        )
+                    else:
+                        filtered_pool.append(res)
+                ranking_pool = filtered_pool
+
             top_candidates = select_top_candidates(
-                list(pre_screened_map.values()),
+                ranking_pool,
                 max_candidates=self.max_candidates_for_ai,
             )
             selected_symbols = {candidate.symbol for candidate in top_candidates}
@@ -883,6 +918,18 @@ class TradingBotOrchestrator:
                             status="rejected_universe",
                             approved=False,
                             reasons=list(pre_screened.rejection_reasons),
+                            screening_result=pre_screened,
+                        )
+                    )
+                    continue
+                if symbol in prefiltered_volume_reasons:
+                    outcomes.append(
+                        TickerPipelineOutcome(
+                            symbol=symbol,
+                            stage_reached="analyst_prefilter",
+                            status="rejected_analyst_prefilter",
+                            approved=False,
+                            reasons=[prefiltered_volume_reasons[symbol]],
                             screening_result=pre_screened,
                         )
                     )
@@ -1060,7 +1107,13 @@ def _run_backtest_cli(
         min_relative_volume=settings.min_relative_volume,
     )
     engine = BacktestEngine(guardian=guardian or RiskGuardian(), config=config)
-    report = engine.run(market_data=market_data, vix_series=vix_series)
+    corr_matrix = compute_return_correlation_matrix(market_data)
+    report = engine.run(
+        market_data=market_data,
+        vix_series=vix_series,
+        sector_map=settings.sector_map,
+        correlation_matrix=corr_matrix,
+    )
     metrics = report.metrics
 
     summary = (

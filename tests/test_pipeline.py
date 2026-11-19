@@ -1294,3 +1294,44 @@ def test_orchestrator_skips_gemini_call_when_deterministic_prefilter_fails(tmp_p
     assert any("independent_sources_count 2 < 3" in r for r in outcome.reasons)
     mocks["analyst"].evaluate.assert_not_called()
     mocks["execution_client"].submit_limit_buy.assert_not_called()
+
+
+def test_orchestrator_prefilter_preserves_top_candidate_slots_for_volume_confirmed_tickers(
+    tmp_path: Path,
+) -> None:
+    now_ny = datetime(2026, 11, 19, 11, 30, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "slots.db")
+    screening_map = {
+        "LOWVOL": _make_screening_result("LOWVOL", vix=18.0),
+        "HIGHVOL": _make_screening_result("HIGHVOL", vix=18.0),
+    }
+    news_items = [
+        _make_news(now_ny - timedelta(minutes=10), source="Reuters"),
+        _make_news(now_ny - timedelta(minutes=15), source="Bloomberg"),
+        _make_news(now_ny - timedelta(minutes=20), source="Benzinga"),
+    ]
+    orch, mocks = _build_mock_orchestrator(
+        audit_store=store,
+        screening_result=screening_map["LOWVOL"],
+        news_items=news_items,
+        analyst_result=_make_analyst_result("HIGHVOL", approved=True),
+    )
+    orch.max_candidates_for_ai = 1
+    orch.skip_ai_on_prefilter_fail = True
+    mocks["screener"].screen_symbol.side_effect = lambda sym, **kw: screening_map[sym]
+    mocks["analyst"].evaluate.side_effect = lambda **kw: _make_analyst_result(
+        kw["symbol"], approved=True
+    )
+
+    report = orch.run_cycle(
+        symbols=["LOWVOL", "HIGHVOL"],
+        now=now_ny,
+        dry_run=True,
+        current_volumes={"LOWVOL": 800_000.0, "HIGHVOL": 1_500_000.0},
+        avg_volumes_20d={"LOWVOL": 1_000_000.0, "HIGHVOL": 1_000_000.0},
+    )
+
+    by_sym = {o.symbol: o for o in report.ticker_outcomes}
+    assert by_sym["LOWVOL"].status == "rejected_analyst_prefilter"
+    assert by_sym["HIGHVOL"].approved is True
+    assert [c.kwargs["symbol"] for c in mocks["analyst"].evaluate.call_args_list] == ["HIGHVOL"]

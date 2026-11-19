@@ -452,7 +452,8 @@ class BacktestEngine:
             day_start_equity = prev_equity
             daily_pnl = equity - day_start_equity
 
-            # 3. Evaluate deterministic entry setups and gate through RiskGuardian
+            # 3. Collect and rank deterministic entry setups, then gate through RiskGuardian
+            day_candidates: list[tuple[float, str, _PreparedSymbol, float, float]] = []
             for sym, p in prepared.items():
                 if sym in open_positions:
                     continue
@@ -496,6 +497,16 @@ class BacktestEngine:
                 if bar_atr <= 0.0:
                     continue
 
+                setup_score = (
+                    (self.config.rsi_entry_max - rsi_val) * 0.5
+                    + min(rel_vol, 3.0) * 10.0
+                    + ((bar_close - sma_val) / sma_val) * 15.0
+                )
+                day_candidates.append((setup_score, sym, p, bar_close, bar_atr))
+
+            day_candidates.sort(key=lambda item: (-item[0], item[1]))
+
+            for _, sym, p, bar_close, bar_atr in day_candidates:
                 entry_price = bar_close * (1.0 + self.config.slippage_pct)
                 portfolio_positions = [
                     PortfolioPosition(
