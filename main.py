@@ -16,7 +16,14 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from src.analyst import AnalystConfig, AnalystEvaluationResult, GeminiAnalyst, NewsAggregator, NewsItem
+from src.analyst import (
+    AnalystConfig,
+    AnalystEvaluationResult,
+    GeminiAnalyst,
+    NewsAggregator,
+    NewsItem,
+    compute_relative_volume,
+)
 from src.config import StrategySettings, load_fed_dates, load_strategy_settings
 from src.guardian import (
     GuardianDecision,
@@ -30,6 +37,7 @@ from src.storage import DEFAULT_DB_PATH, TradingAuditStore
 from src.universe import (
     FmpClient,
     MarketDataClient,
+    UniverseConfig,
     UniverseScreener,
     UniverseScreeningResult,
     compute_return_correlation_matrix,
@@ -246,6 +254,7 @@ class TradingBotOrchestrator:
         max_candidates_for_ai: int = 5,
         default_fed_dates: Sequence[datetime] = (),
         candle_store: Any | None = None,
+        skip_ai_on_prefilter_fail: bool = False,
     ) -> None:
         self.audit_store = audit_store or TradingAuditStore()
         self.guardian = guardian or RiskGuardian()
@@ -267,6 +276,7 @@ class TradingBotOrchestrator:
         self.take_profit_atr_multiplier = float(take_profit_atr_multiplier)
         self.max_candidates_for_ai = int(max_candidates_for_ai)
         self.default_fed_dates: tuple[datetime, ...] = tuple(default_fed_dates)
+        self.skip_ai_on_prefilter_fail = bool(skip_ai_on_prefilter_fail)
 
     @property
     def screener(self) -> UniverseScreener:
@@ -496,6 +506,32 @@ class TradingBotOrchestrator:
                 reasons=[window_reason],
                 screening_result=screening,
             )
+
+        # Deterministic pre-LLM quota guard: skip Gemini call if volume or source consensus
+        # already fails hard anti-disinformation thresholds.
+        if self.skip_ai_on_prefilter_fail and isinstance(analyst_config, AnalystConfig):
+            prefilter_reasons: list[str] = []
+            rel_vol = compute_relative_volume(cur_vol, avg_vol)
+            if rel_vol < analyst_config.min_relative_volume:
+                prefilter_reasons.append(
+                    f"relative_volume {rel_vol:.2f} < {analyst_config.min_relative_volume:.2f} "
+                    "(price-volume divergence; skipped LLM call)"
+                )
+            distinct_sources = NewsAggregator.distinct_sources(news_items)
+            if len(distinct_sources) < analyst_config.min_independent_sources:
+                prefilter_reasons.append(
+                    f"independent_sources_count {len(distinct_sources)} < "
+                    f"{analyst_config.min_independent_sources} (skipped LLM call)"
+                )
+            if prefilter_reasons:
+                return TickerPipelineOutcome(
+                    symbol=symbol,
+                    stage_reached="analyst_prefilter",
+                    status="rejected_analyst_prefilter",
+                    approved=False,
+                    reasons=prefilter_reasons,
+                    screening_result=screening,
+                )
 
         # Stage 3: AI Analyst evaluation
         analyst_result = self.analyst.evaluate(
@@ -1068,11 +1104,17 @@ def _build_orchestrator_from_settings(
         audit_store=audit_store,
         config=exec_config,
     )
+    screener = UniverseScreener(
+        market_data=MarketDataClient(),
+        fmp_client=FmpClient(store=audit_store),
+        config=UniverseConfig(max_spread_pct=settings.max_spread_pct),
+    )
     analyst = GeminiAnalyst(
         audit_store=audit_store,
         config=AnalystConfig(min_relative_volume=settings.min_relative_volume),
     )
     return TradingBotOrchestrator(
+        screener=screener,
         analyst=analyst,
         execution_client=execution_client,
         position_manager=position_manager,
@@ -1084,6 +1126,7 @@ def _build_orchestrator_from_settings(
         take_profit_atr_multiplier=settings.atr_take_profit_multiplier,
         max_candidates_for_ai=max_candidates,
         default_fed_dates=load_fed_dates(),
+        skip_ai_on_prefilter_fail=True,
     )
 
 

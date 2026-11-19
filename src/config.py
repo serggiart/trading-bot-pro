@@ -29,6 +29,7 @@ class StrategySettings:
     min_target_return_pct: float = 0.01
     rsi_entry_max: float = 60.0
     min_relative_volume: float = 1.2
+    max_spread_pct: float = 0.015
     confirmation_delay_minutes: float = 2.0
     max_confirmation_delay_minutes: float = 5.0
     default_sector: str = "Technology"
@@ -51,6 +52,8 @@ class StrategySettings:
             raise ValueError("rsi_entry_max must be in (0, 100]")
         if self.min_relative_volume < 0.0:
             raise ValueError("min_relative_volume must be non-negative")
+        if not 0.0 < self.max_spread_pct <= 1.0:
+            raise ValueError("max_spread_pct must be in (0, 1]")
         if self.confirmation_delay_minutes < 0.0:
             raise ValueError("confirmation_delay_minutes must be non-negative")
         if self.max_confirmation_delay_minutes < self.confirmation_delay_minutes:
@@ -125,6 +128,7 @@ def load_strategy_settings(
         min_relative_volume=float(
             raw_data.get("min_relative_volume", defaults.min_relative_volume)
         ),
+        max_spread_pct=float(raw_data.get("max_spread_pct", defaults.max_spread_pct)),
         confirmation_delay_minutes=float(
             raw_data.get("confirmation_delay_minutes", defaults.confirmation_delay_minutes)
         ),

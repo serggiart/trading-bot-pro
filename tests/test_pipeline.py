@@ -1258,3 +1258,39 @@ def test_orchestrator_auto_resolves_correlation_and_fomc_blackout(tmp_path: Path
     assert corr_report.ticker_outcomes[0].status == "vetoed_guardian"
     assert any("Correlation" in r and "QQQ" in r for r in corr_report.ticker_outcomes[0].reasons)
     mocks_corr["execution_client"].submit_limit_buy.assert_not_called()
+
+
+def test_orchestrator_skips_gemini_call_when_deterministic_prefilter_fails(tmp_path: Path) -> None:
+    now_ny = datetime(2026, 11, 19, 11, 30, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "prefilter.db")
+    screening = _make_screening_result("XOM", vix=18.0)
+    # 2 sources (< 3) and relative volume 0.84 (< 1.20)
+    news_items = [
+        _make_news(now_ny - timedelta(minutes=10), source="Reuters"),
+        _make_news(now_ny - timedelta(minutes=20), source="Bloomberg"),
+    ]
+    orch, mocks = _build_mock_orchestrator(
+        audit_store=store,
+        screening_result=screening,
+        news_items=news_items,
+        analyst_result=_make_analyst_result("XOM", approved=True),
+    )
+    orch.skip_ai_on_prefilter_fail = True
+
+    report = orch.run_cycle(
+        symbols=["XOM"],
+        now=now_ny,
+        dry_run=True,
+        current_volumes={"XOM": 840_000.0},
+        avg_volumes_20d={"XOM": 1_000_000.0},
+    )
+
+    assert len(report.ticker_outcomes) == 1
+    outcome = report.ticker_outcomes[0]
+    assert outcome.approved is False
+    assert outcome.stage_reached == "analyst_prefilter"
+    assert outcome.status == "rejected_analyst_prefilter"
+    assert any("relative_volume 0.84" in r for r in outcome.reasons)
+    assert any("independent_sources_count 2 < 3" in r for r in outcome.reasons)
+    mocks["analyst"].evaluate.assert_not_called()
+    mocks["execution_client"].submit_limit_buy.assert_not_called()

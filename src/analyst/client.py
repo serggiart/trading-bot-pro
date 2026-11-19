@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Literal
 
+import httpx
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
@@ -23,7 +25,7 @@ from src.analyst.news import NewsAggregator
 from src.storage import TradingAuditStore
 
 logger = logging.getLogger(__name__)
-_RETRYABLE_MODEL_STATUS_CODES = frozenset({404, 429, 503})
+_RETRYABLE_MODEL_STATUS_CODES = frozenset({404, 429, 500, 503, 504})
 
 
 def compute_relative_volume(current_volume: float, avg_volume_20d: float) -> float:
@@ -74,6 +76,48 @@ def evaluate_report_gates(
     return reasons
 
 
+def _select_prompt_articles(
+    news_items: Sequence[NewsItem],
+    max_articles: int,
+) -> list[NewsItem]:
+    """Select up to `max_articles` newest items while preserving distinct source coverage."""
+    if not news_items or max_articles <= 0:
+        return []
+    ordered = sorted(news_items, key=lambda item: item.published_at, reverse=True)
+    if len(ordered) <= max_articles:
+        return ordered
+
+    selected: list[NewsItem] = []
+    selected_indices: set[int] = set()
+    seen_sources: set[str] = set()
+
+    # Pass 1: guarantee at least the newest article from each distinct source
+    for idx, item in enumerate(ordered):
+        source_key = item.source.strip().lower()
+        if source_key not in seen_sources:
+            seen_sources.add(source_key)
+            selected.append(item)
+            selected_indices.add(idx)
+            if len(selected) >= max_articles:
+                return selected
+
+    # Pass 2: fill remaining budget with the freshest remaining articles
+    for idx, item in enumerate(ordered):
+        if idx not in selected_indices:
+            selected.append(item)
+            if len(selected) >= max_articles:
+                break
+    return selected
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    """Truncate text cleanly to `max_chars` characters."""
+    cleaned = text.strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return f"{cleaned[: max_chars - 3].rstrip()}..."
+
+
 def _build_analysis_prompt(
     symbol: str,
     current_volume: float,
@@ -84,14 +128,19 @@ def _build_analysis_prompt(
     config: AnalystConfig,
 ) -> str:
     """Build a concise, deterministic prompt for Gemini structured evaluation."""
-    if news_items:
+    prompt_items = _select_prompt_articles(news_items, config.max_prompt_articles)
+    if prompt_items:
         formatted_articles = "\n".join(
             (
                 f"- [{item.published_at.isoformat()}] ({item.provider}/{item.source}) "
                 f"{item.headline}"
-                + (f" — {item.summary}" if item.summary else "")
+                + (
+                    f" — {_truncate_text(item.summary, config.max_summary_chars)}"
+                    if item.summary
+                    else ""
+                )
             )
-            for item in news_items
+            for item in prompt_items
         )
     else:
         formatted_articles = "- No recent news articles found in the lookback window."
@@ -104,7 +153,7 @@ def _build_analysis_prompt(
         f"- 20-Day Average Volume: {avg_volume_20d:,.0f}\n"
         f"- Relative Volume: {relative_volume:.2f}x "
         f"(institutional confirmation threshold: {config.min_relative_volume:.2f}x)\n"
-        f"- Total Deduplicated Articles: {len(news_items)}\n"
+        f"- Total Deduplicated Articles: {len(news_items)} (showing {len(prompt_items)} most recent)\n"
         f"- Distinct Sources ({len(sources)}): {sources_summary}\n\n"
         f"Recent News (America/New_York):\n"
         f"{formatted_articles}\n\n"
@@ -136,6 +185,29 @@ def _parse_analyst_report(response: Any) -> AnalystReport:
 class GeminiAnalyst:
     """Probabilistic AI news/volume analyst wrapped in strict deterministic gates."""
 
+    @staticmethod
+    def _build_default_genai_client(
+        api_key: str | None,
+        config: AnalystConfig,
+    ) -> Any:
+        """Build a google.genai.Client with optional IPv4 transport to avoid IPv6 stalls."""
+        kwargs: dict[str, Any] = {}
+        if api_key:
+            kwargs["api_key"] = api_key
+        if config.force_ipv4:
+            read_timeout = max(config.request_timeout_ms / 1000.0, 5.0)
+            http_client = httpx.Client(
+                transport=httpx.HTTPTransport(local_address="0.0.0.0"),
+                timeout=httpx.Timeout(
+                    connect=5.0,
+                    read=read_timeout,
+                    write=10.0,
+                    pool=5.0,
+                ),
+            )
+            kwargs["http_options"] = types.HttpOptions(httpx_client=http_client)
+        return genai.Client(**kwargs)
+
     def __init__(
         self,
         audit_store: TradingAuditStore | None = None,
@@ -149,12 +221,17 @@ class GeminiAnalyst:
         self.news_aggregator = news_aggregator or NewsAggregator()
         self.config = config or AnalystConfig()
         self._api_key = api_key
+        self._model_cooldowns: dict[str, float] = {}
 
         if client is not None:
             self._client: Any | None = client
         else:
             resolved_key = api_key or os.getenv("GEMINI_API_KEY")
-            self._client = genai.Client(api_key=resolved_key) if resolved_key else None
+            self._client = (
+                self._build_default_genai_client(resolved_key, self.config)
+                if resolved_key
+                else None
+            )
 
     @property
     def audit_store(self) -> TradingAuditStore:
@@ -167,10 +244,32 @@ class GeminiAnalyst:
         """Return injected or lazily constructed google.genai.Client."""
         if self._client is None:
             resolved_key = self._api_key or os.getenv("GEMINI_API_KEY")
-            self._client = (
-                genai.Client(api_key=resolved_key) if resolved_key else genai.Client()
-            )
+            self._client = self._build_default_genai_client(resolved_key, self.config)
         return self._client
+
+    def _ordered_candidate_models(self) -> list[str]:
+        """Return configured models with currently cooled-down models deprioritized."""
+        configured = list(
+            dict.fromkeys([self.config.model_name, *self.config.fallback_models])
+        )
+        now = time.monotonic()
+        healthy: list[str] = []
+        cooled_down: list[str] = []
+        for model_id in configured:
+            until = self._model_cooldowns.get(model_id, 0.0)
+            if until > now:
+                cooled_down.append(model_id)
+            else:
+                self._model_cooldowns.pop(model_id, None)
+                healthy.append(model_id)
+        return healthy + cooled_down
+
+    def _mark_model_cooldown(self, model_id: str) -> None:
+        """Temporarily deprioritize a model that returned a transient failure/timeout."""
+        if self.config.model_cooldown_seconds > 0.0:
+            self._model_cooldowns[model_id] = (
+                time.monotonic() + self.config.model_cooldown_seconds
+            )
 
     def evaluate(
         self,
@@ -216,9 +315,7 @@ class GeminiAnalyst:
                 retry_options=types.HttpRetryOptions(attempts=self.config.retry_attempts),
             ),
         )
-        candidate_models = list(
-            dict.fromkeys([self.config.model_name, *self.config.fallback_models])
-        )
+        candidate_models = self._ordered_candidate_models()
         response: Any = None
         last_exc: Exception | None = None
         for idx, model_id in enumerate(candidate_models):
@@ -228,17 +325,29 @@ class GeminiAnalyst:
                     contents=prompt,
                     config=gen_config,
                 )
+                self._model_cooldowns.pop(model_id, None)
                 break
             except genai_errors.APIError as exc:
                 status_code = getattr(exc, "code", None)
-                if (
-                    status_code in _RETRYABLE_MODEL_STATUS_CODES
-                    and idx < len(candidate_models) - 1
-                ):
+                if status_code in _RETRYABLE_MODEL_STATUS_CODES:
+                    self._mark_model_cooldown(model_id)
+                    if idx < len(candidate_models) - 1:
+                        logger.warning(
+                            "Gemini model %s returned %s; falling back to %s",
+                            model_id,
+                            status_code,
+                            candidate_models[idx + 1],
+                        )
+                        last_exc = exc
+                        continue
+                raise
+            except (httpx.TimeoutException, TimeoutError) as exc:
+                self._mark_model_cooldown(model_id)
+                if idx < len(candidate_models) - 1:
                     logger.warning(
-                        "Gemini model %s returned %s; falling back to %s",
+                        "Gemini model %s timed out (%s); falling back to %s",
                         model_id,
-                        status_code,
+                        type(exc).__name__,
                         candidate_models[idx + 1],
                     )
                     last_exc = exc
