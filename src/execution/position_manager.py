@@ -295,6 +295,11 @@ class PositionManager:
             )
 
         # 4. Trailing Stop Upward Ratchet
+        previous_highest = (
+            position.highest_price
+            if position.highest_price is not None
+            else position.entry_price
+        )
         new_stop = compute_trailing_stop(
             entry_price=position.entry_price,
             current_price=current_price,
@@ -333,7 +338,20 @@ class PositionManager:
                 new_stop_price=new_stop,
             )
 
-        # 5. Hold
+        # 5. Hold (still persist new intraday highs so trailing memory survives restarts)
+        if not dry_run and self.audit_store is not None and peak > previous_highest:
+            self.audit_store.upsert_position_state(
+                symbol=position.symbol,
+                qty=position.qty,
+                entry_price=position.entry_price,
+                current_stop_price=position.current_stop_price,
+                atr_14=position.atr_14,
+                opened_at=opened_ny,
+                highest_price=peak,
+                stop_order_id=position.stop_order_id,
+                client_order_id=position.client_order_id,
+                updated_at=eval_now,
+            )
         return ExitEvaluationResult(
             symbol=position.symbol,
             action="HOLD",

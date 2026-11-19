@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import inspect
 import logging
 import signal
+import threading
 import time as time_module
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -31,6 +33,7 @@ from src.guardian import (
     PortfolioPosition,
     RiskGuardian,
     TradeCandidate,
+    check_economic_calendar,
 )
 from src.notifications import TelegramNotifier
 from src.storage import DEFAULT_DB_PATH, TradingAuditStore
@@ -794,7 +797,17 @@ class TradingBotOrchestrator:
             if not open_positions:
                 reconcile_fn = getattr(self.execution_client, "reconcile_managed_positions", None)
                 if callable(reconcile_fn):
-                    reconciled = reconcile_fn(now=now_ny)
+                    try:
+                        sig = inspect.signature(reconcile_fn)
+                        if "ensure_protective_stops" in sig.parameters:
+                            reconciled = reconcile_fn(
+                                now=now_ny,
+                                ensure_protective_stops=not dry_run,
+                            )
+                        else:
+                            reconciled = reconcile_fn(now=now_ny)
+                    except (TypeError, ValueError):
+                        reconciled = reconcile_fn(now=now_ny)
                     if isinstance(reconciled, Sequence):
                         open_positions = reconciled
 
@@ -834,10 +847,64 @@ class TradingBotOrchestrator:
         pre_screened_map: dict[str, UniverseScreeningResult] = {}
         pre_screen_errors: dict[str, str] = {}
         prefiltered_volume_reasons: dict[str, str] = {}
+        prefiltered_skip_outcomes: dict[str, TickerPipelineOutcome] = {}
         selected_symbols: set[str] | None = None
+
+        held_symbols = {
+            pos.symbol.strip().upper()
+            for pos in portfolio_positions
+            if getattr(pos, "symbol", None)
+        }
+        vix_blocked_reason: str | None = None
+        if (
+            self.skip_ai_on_prefilter_fail
+            and shared_vix is not None
+            and shared_vix > self.guardian.config.max_vix
+        ):
+            vix_blocked_reason = (
+                f"VIX {shared_vix:.2f} > {self.guardian.config.max_vix:.2f} (skipped LLM call)"
+            )
+
+        fed_blackout_reason: str | None = None
+        if self.skip_ai_on_prefilter_fail and resolved_fed_dates:
+            fed_check = check_economic_calendar(
+                now=now_ny,
+                earnings_dates=(),
+                fed_dates=resolved_fed_dates,
+                blackout_hours=self.guardian.config.blackout_hours,
+            )
+            if not fed_check.passed:
+                fed_blackout_reason = f"{fed_check.reason} (skipped LLM call)"
 
         if len(cleaned_symbols) > 1 and self.max_candidates_for_ai > 0:
             for symbol in cleaned_symbols:
+                if self.skip_ai_on_prefilter_fail and symbol in held_symbols:
+                    prefiltered_skip_outcomes[symbol] = TickerPipelineOutcome(
+                        symbol=symbol,
+                        stage_reached="portfolio_prefilter",
+                        status="skipped_already_held",
+                        approved=False,
+                        reasons=[f"Symbol {symbol} already held in portfolio (skipped LLM call)"],
+                    )
+                    continue
+                if vix_blocked_reason is not None:
+                    prefiltered_skip_outcomes[symbol] = TickerPipelineOutcome(
+                        symbol=symbol,
+                        stage_reached="guardian_prefilter",
+                        status="skipped_vix_blackout",
+                        approved=False,
+                        reasons=[vix_blocked_reason],
+                    )
+                    continue
+                if fed_blackout_reason is not None:
+                    prefiltered_skip_outcomes[symbol] = TickerPipelineOutcome(
+                        symbol=symbol,
+                        stage_reached="calendar_prefilter",
+                        status="skipped_calendar_blackout",
+                        approved=False,
+                        reasons=[fed_blackout_reason],
+                    )
+                    continue
                 try:
                     if shared_vix is not None:
                         pre_screened_map[symbol] = self.screener.screen_symbol(
@@ -862,6 +929,28 @@ class TradingBotOrchestrator:
                     if not res.passed:
                         filtered_pool.append(res)
                         continue
+                    # Skip symbols inside an active 24h earnings blackout before wasting AI calls
+                    if res.fundamentals is not None and res.fundamentals.earnings_dates:
+                        earnings_dts = _parse_earnings_dates(
+                            res.fundamentals.earnings_dates,
+                            now_ny=now_ny,
+                        )
+                        cal_check = check_economic_calendar(
+                            now=now_ny,
+                            earnings_dates=earnings_dts,
+                            fed_dates=(),
+                            blackout_hours=self.guardian.config.blackout_hours,
+                        )
+                        if not cal_check.passed:
+                            prefiltered_skip_outcomes[res.symbol] = TickerPipelineOutcome(
+                                symbol=res.symbol,
+                                stage_reached="calendar_prefilter",
+                                status="skipped_calendar_blackout",
+                                approved=False,
+                                reasons=[f"{cal_check.reason} (skipped LLM call)"],
+                                screening_result=res,
+                            )
+                            continue
                     ind = res.indicators
                     quote = res.quote
                     ind_latest = float(getattr(ind, "latest_volume", 0.0) or 0.0) if ind else 0.0
@@ -896,6 +985,20 @@ class TradingBotOrchestrator:
 
         outcomes: list[TickerPipelineOutcome] = []
         for symbol in cleaned_symbols:
+            if symbol in prefiltered_skip_outcomes:
+                outcomes.append(prefiltered_skip_outcomes[symbol])
+                continue
+            if self.skip_ai_on_prefilter_fail and symbol in held_symbols:
+                outcomes.append(
+                    TickerPipelineOutcome(
+                        symbol=symbol,
+                        stage_reached="portfolio_prefilter",
+                        status="skipped_already_held",
+                        approved=False,
+                        reasons=[f"Symbol {symbol} already held in portfolio (skipped LLM call)"],
+                    )
+                )
+                continue
             if symbol in pre_screen_errors:
                 outcomes.append(
                     TickerPipelineOutcome(
@@ -1215,12 +1318,11 @@ def _run_loop(
 ) -> int:
     """Run one or continuous cycles with signal handling and exponential error backoff."""
     enforce_market_hours = not args.ignore_market_hours
-    stop_requested = False
+    stop_event = threading.Event()
 
     def _request_stop(signum: int, _frame: object) -> None:
-        nonlocal stop_requested
         logger.info("Received signal %s; shutting down gracefully after current step.", signum)
-        stop_requested = True
+        stop_event.set()
 
     prev_sigterm = signal.getsignal(signal.SIGTERM)
     prev_sigint = signal.getsignal(signal.SIGINT)
@@ -1229,7 +1331,7 @@ def _run_loop(
 
     consecutive_errors = 0
     try:
-        while not stop_requested:
+        while not stop_event.is_set():
             run_kwargs: dict[str, Any] = {
                 "symbols": symbols,
                 "dry_run": args.dry_run,
@@ -1261,9 +1363,12 @@ def _run_loop(
                     300.0,
                 )
 
-            if not args.loop or stop_requested:
+            if not args.loop or stop_event.is_set():
                 break
-            sleep_fn(wait_seconds)
+            if sleep_fn is time_module.sleep:
+                stop_event.wait(timeout=wait_seconds)
+            else:
+                sleep_fn(wait_seconds)
     except KeyboardInterrupt:
         logger.info("Trading bot stopped cleanly by user interrupt.")
         return 0

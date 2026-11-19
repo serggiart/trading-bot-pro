@@ -148,7 +148,7 @@ def test_submit_limit_buy_oto_and_audit_logging(tmp_path: Path) -> None:
     submitted_req = mock_broker.submit_order.call_args.kwargs["order_data"]
     assert isinstance(submitted_req, LimitOrderRequest)
     assert submitted_req.side == OrderSide.BUY
-    assert submitted_req.time_in_force == TimeInForce.DAY
+    assert submitted_req.time_in_force == TimeInForce.GTC
     assert submitted_req.order_class == OrderClass.OTO
     assert submitted_req.limit_price == 150.15
     assert submitted_req.stop_loss is not None
@@ -740,3 +740,74 @@ def test_submit_limit_buy_fill_gated_state_and_sell_cancels_bracket_legs(
     cancelled_ids = [call.args[0] for call in mock_broker.cancel_order_by_id.call_args_list]
     assert cancelled_ids == ["leg-stop-1", "leg-tp-1"]
     assert store.get_position_state("AAPL") is None
+
+
+def test_reconcile_reattaches_missing_gtc_protective_stop_and_persists_hold_peak(
+    tmp_path: Path,
+) -> None:
+    from alpaca.trading.requests import StopLimitOrderRequest
+
+    store = TradingAuditStore(tmp_path / "gtc_recovery.db")
+    mock_broker = MagicMock()
+    mock_broker.get_all_positions.return_value = [
+        SimpleNamespace(
+            symbol="DIS",
+            qty="100",
+            avg_entry_price="120.00",
+            market_value="12100.00",
+        ),
+    ]
+    # No resting open stop orders at broker (e.g., expired DAY legs)
+    mock_broker.get_orders.return_value = []
+    mock_broker.submit_order.return_value = SimpleNamespace(
+        id="gtc-stop-123",
+        status="accepted",
+    )
+
+    now_ny = datetime(2026, 11, 19, 15, 30, tzinfo=NY_TIMEZONE)
+    store.upsert_position_state(
+        symbol="DIS",
+        qty=100.0,
+        entry_price=120.0,
+        current_stop_price=117.5,
+        atr_14=2.5,
+        opened_at=now_ny,
+        highest_price=120.0,
+        stop_order_id=None,
+        updated_at=now_ny,
+    )
+
+    client = AlpacaExecutionClient(
+        audit_store=store,
+        trading_client=mock_broker,
+        paper=True,
+    )
+    reconciled = client.reconcile_managed_positions(
+        now=now_ny,
+        ensure_protective_stops=True,
+    )
+    assert len(reconciled) == 1
+    assert reconciled[0].stop_order_id == "gtc-stop-123"
+    assert reconciled[0].current_stop_price == pytest.approx(117.5)
+
+    mock_broker.submit_order.assert_called_once()
+    stop_req = mock_broker.submit_order.call_args.kwargs["order_data"]
+    assert isinstance(stop_req, StopLimitOrderRequest)
+    assert stop_req.time_in_force == TimeInForce.GTC
+    assert stop_req.side == OrderSide.SELL
+    assert stop_req.stop_price == 117.5
+
+    # Verify PositionManager persists new peak into SQLite even on HOLD
+    pm = PositionManager(execution_client=client, audit_store=store)
+    hold_res = pm.evaluate_and_manage(
+        reconciled[0],
+        current_price=122.0,
+        bid_price=121.9,
+        now=now_ny + timedelta(minutes=10),
+        dry_run=False,
+    )
+    assert hold_res.action == "HOLD"
+    persisted = store.get_position_state("DIS")
+    assert persisted is not None
+    assert persisted.highest_price == pytest.approx(122.0)
+    store.close()

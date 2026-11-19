@@ -15,6 +15,7 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     ReplaceOrderRequest,
+    StopLimitOrderRequest,
     StopLossRequest,
     TakeProfitRequest,
 )
@@ -241,7 +242,7 @@ class AlpacaExecutionClient:
                 symbol=normalized_symbol,
                 qty=qty,
                 side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
+                time_in_force=TimeInForce.GTC,
                 limit_price=limit_price,
                 order_class=order_class,
                 stop_loss=stop_loss,
@@ -255,7 +256,7 @@ class AlpacaExecutionClient:
                 symbol=normalized_symbol,
                 qty=qty,
                 side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
+                time_in_force=TimeInForce.GTC,
                 limit_price=limit_price,
                 order_class=order_class,
                 stop_loss=stop_loss,
@@ -510,13 +511,101 @@ class AlpacaExecutionClient:
             reason=reason,
         )
 
+    def submit_protective_stop_limit(
+        self,
+        symbol: str,
+        qty: float,
+        stop_price: float,
+        dry_run: bool = False,
+        client_order_id: str | None = None,
+    ) -> ExecutionOrderResult:
+        """Submit a GTC Stop-Limit sell order to protect an open swing position overnight."""
+        normalized_symbol = symbol.strip().upper()
+        if not normalized_symbol:
+            raise ValueError("symbol must be a non-empty string")
+        if qty <= 0:
+            raise ValueError("qty must be positive")
+        if stop_price <= 0:
+            raise ValueError("stop_price must be positive")
+
+        rounded_stop = round(stop_price, 2)
+        limit_price = calculate_limit_sell_price(
+            reference_price=rounded_stop,
+            slippage_pct=self.config.exit_slippage_pct,
+        )
+        resolved_client_id = (
+            client_order_id.strip()
+            if client_order_id is not None and client_order_id.strip()
+            else _generate_client_order_id("stop", normalized_symbol)
+        )
+        audit_metadata: dict[str, Any] = {
+            "paper": self.paper,
+            "dry_run": dry_run,
+            "order_class": "protective_stop_limit",
+            "time_in_force": TimeInForce.GTC.value,
+        }
+
+        if dry_run:
+            return ExecutionOrderResult(
+                submitted=False,
+                client_order_id=resolved_client_id,
+                broker_order_id=None,
+                symbol=normalized_symbol,
+                side="SELL",
+                qty=qty,
+                limit_price=limit_price,
+                stop_price=rounded_stop,
+                order_type="stop_limit",
+                status="dry_run",
+                reason="Dry run enabled; protective stop not sent to broker",
+            )
+
+        stop_request = StopLimitOrderRequest(
+            symbol=normalized_symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            stop_price=rounded_stop,
+            limit_price=limit_price,
+            client_order_id=resolved_client_id,
+        )
+        broker_order = self._require_trading_client().submit_order(order_data=stop_request)
+        raw_broker_id = getattr(broker_order, "id", None)
+        broker_order_id = str(raw_broker_id) if raw_broker_id is not None else None
+        status = _extract_broker_status(broker_order, default="submitted")
+
+        self._log_audit_order(
+            client_order_id=resolved_client_id,
+            symbol=normalized_symbol,
+            side="SELL",
+            qty=qty,
+            limit_price=limit_price,
+            stop_price=rounded_stop,
+            status=status,
+            broker_order_id=broker_order_id,
+            metadata=audit_metadata,
+        )
+        return ExecutionOrderResult(
+            submitted=True,
+            client_order_id=resolved_client_id,
+            broker_order_id=broker_order_id,
+            symbol=normalized_symbol,
+            side="SELL",
+            qty=qty,
+            limit_price=limit_price,
+            stop_price=rounded_stop,
+            order_type="stop_limit",
+            status=status,
+            reason="Attached GTC protective stop-limit order",
+        )
+
     def update_stop_order(
         self,
         stop_order_id: str,
         new_stop_price: float,
         dry_run: bool = False,
     ) -> bool:
-        """Replace an active stop order price on the broker when not in dry_run mode."""
+        """Replace an active stop or stop-limit order price on the broker when not in dry_run."""
         cleaned_order_id = stop_order_id.strip()
         if not cleaned_order_id:
             raise ValueError("stop_order_id must be a non-empty string")
@@ -526,11 +615,28 @@ class AlpacaExecutionClient:
         if dry_run:
             return False
 
-        replace_request = ReplaceOrderRequest(stop_price=round(new_stop_price, 2))
-        self._require_trading_client().replace_order_by_id(
-            order_id=cleaned_order_id,
-            order_data=replace_request,
-        )
+        rounded_stop = round(new_stop_price, 2)
+        trading_client = self._require_trading_client()
+        replace_request = ReplaceOrderRequest(stop_price=rounded_stop)
+        try:
+            trading_client.replace_order_by_id(
+                order_id=cleaned_order_id,
+                order_data=replace_request,
+            )
+        except Exception as exc:
+            if "limit_price" not in str(exc).lower():
+                raise
+            limit_price = calculate_limit_sell_price(
+                reference_price=rounded_stop,
+                slippage_pct=self.config.exit_slippage_pct,
+            )
+            trading_client.replace_order_by_id(
+                order_id=cleaned_order_id,
+                order_data=ReplaceOrderRequest(
+                    stop_price=rounded_stop,
+                    limit_price=limit_price,
+                ),
+            )
         return True
 
     def get_account_snapshot(self) -> AccountSnapshot | None:
@@ -596,6 +702,7 @@ class AlpacaExecutionClient:
         self,
         atr_lookup: Mapping[str, float] | None = None,
         now: datetime | None = None,
+        ensure_protective_stops: bool = False,
     ) -> list[ManagedPosition]:
         """Reconstruct crash-safe ManagedPositions from broker state and SQLite position_state."""
         now_ny = ensure_ny_datetime(now)
@@ -728,6 +835,25 @@ class AlpacaExecutionClient:
                 else entry_price
             )
             stop_order_id = broker_stop_id or (stored.stop_order_id if stored is not None else None)
+            if ensure_protective_stops and broker_stop_id is None and current_stop > 0.0:
+                current_mkt_price = _to_float(getattr(pos, "current_price", None), default=0.0)
+                if current_mkt_price <= 0.0 and qty > 0.0:
+                    mkt_val = _to_float(getattr(pos, "market_value", None), default=0.0)
+                    current_mkt_price = mkt_val / qty if mkt_val > 0.0 else entry_price
+                safe_stop = round(min(current_stop, current_mkt_price * 0.995), 2) if current_mkt_price > 0.0 else round(current_stop, 2)
+                if safe_stop > 0.0:
+                    try:
+                        stop_res = self.submit_protective_stop_limit(
+                            symbol=symbol,
+                            qty=qty,
+                            stop_price=safe_stop,
+                            dry_run=False,
+                        )
+                        if stop_res.broker_order_id:
+                            stop_order_id = stop_res.broker_order_id
+                        current_stop = safe_stop
+                    except Exception:
+                        pass
             client_order_id = (
                 stored.client_order_id
                 if stored is not None

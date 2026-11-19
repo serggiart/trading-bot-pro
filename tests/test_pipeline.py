@@ -1335,3 +1335,106 @@ def test_orchestrator_prefilter_preserves_top_candidate_slots_for_volume_confirm
     assert by_sym["LOWVOL"].status == "rejected_analyst_prefilter"
     assert by_sym["HIGHVOL"].approved is True
     assert [c.kwargs["symbol"] for c in mocks["analyst"].evaluate.call_args_list] == ["HIGHVOL"]
+
+
+def test_orchestrator_skips_ai_for_held_symbols_and_earnings_blackout_and_fast_sigterm(
+    tmp_path: Path,
+) -> None:
+    import os
+    import signal
+    import threading
+    import time
+
+    from main import _run_loop, parse_args
+    from src.guardian import PortfolioPosition
+
+    now_ny = datetime(2026, 11, 19, 12, 0, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "skip_held_cal.db")
+
+    held_screening = _make_screening_result("DIS", vix=20.0)
+    earnings_screening = UniverseScreeningResult(
+        symbol="WMT",
+        passed=True,
+        quote=MarketQuote("WMT", 100.0, 99.9, 100.1, 0.002, 1_500_000.0),
+        indicators=TechnicalIndicators(
+            symbol="WMT",
+            current_price=100.0,
+            sma_200=90.0,
+            atr_14=2.0,
+            above_sma_200=True,
+            vix=20.0,
+            latest_volume=2_000_000.0,
+            avg_volume_20d=1_000_000.0,
+            ema_20=98.0,
+            rsi_14=50.0,
+        ),
+        fundamentals=FundamentalData(
+            symbol="WMT",
+            free_cash_flow=5e9,
+            debt_to_equity=0.5,
+            earnings_dates=["2026-11-19"],
+        ),
+    )
+    fresh_screening = _make_screening_result("KO", vix=20.0)
+    smap = {"DIS": held_screening, "WMT": earnings_screening, "KO": fresh_screening}
+    news_items = [
+        _make_news(now_ny - timedelta(minutes=10), source="Reuters"),
+        _make_news(now_ny - timedelta(minutes=15), source="Bloomberg"),
+        _make_news(now_ny - timedelta(minutes=20), source="Benzinga"),
+    ]
+    orch, mocks = _build_mock_orchestrator(
+        audit_store=store,
+        screening_result=fresh_screening,
+        news_items=news_items,
+        analyst_result=_make_analyst_result("KO", approved=True),
+    )
+    orch.skip_ai_on_prefilter_fail = True
+    mocks["screener"].screen_symbol.side_effect = lambda sym, **kw: smap[sym]
+
+    report = orch.run_cycle(
+        symbols=["DIS", "WMT", "KO"],
+        now=now_ny,
+        dry_run=True,
+        portfolio_positions=[
+            PortfolioPosition(
+                symbol="DIS",
+                sector="Communication Services",
+                market_value=10_000.0,
+                shares=100.0,
+                avg_price=100.0,
+            )
+        ],
+        current_volumes={"DIS": 2e6, "WMT": 2e6, "KO": 2e6},
+        avg_volumes_20d={"DIS": 1e6, "WMT": 1e6, "KO": 1e6},
+    )
+
+    by_sym = {o.symbol: o for o in report.ticker_outcomes}
+    assert by_sym["DIS"].status == "skipped_already_held"
+    assert by_sym["WMT"].status == "skipped_calendar_blackout"
+    assert by_sym["KO"].approved is True
+    assert [c.kwargs["symbol"] for c in mocks["analyst"].evaluate.call_args_list] == ["KO"]
+
+    # Verify _run_loop wakes up immediately (< 1.5s) on SIGTERM even with interval_seconds=60
+    fake_bot = MagicMock()
+    fake_bot.notifier = MagicMock()
+    fake_bot.run_cycle.return_value = PipelineCycleReport(
+        timestamp=now_ny,
+        market_open=True,
+        dry_run=True,
+    )
+    args = parse_args(["--loop", "--interval-seconds", "60", "--dry-run"])
+
+    def _send_sigterm() -> None:
+        time.sleep(0.15)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    t = threading.Thread(target=_send_sigterm, daemon=True)
+    t0 = time.monotonic()
+    t.start()
+    rc = _run_loop(fake_bot, ["KO"], args, sleep_fn=time.sleep)
+    elapsed = time.monotonic() - t0
+    t.join(timeout=2.0)
+
+    assert rc == 0
+    assert elapsed < 2.0
+    store.close()
