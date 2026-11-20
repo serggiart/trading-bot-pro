@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import os
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any
@@ -312,11 +314,25 @@ class MarketDataClient:
         ticker_factory: Callable[[str], Any] | None = None,
         api_key: str | None = None,
         secret_key: str | None = None,
+        history_cache_ttl_seconds: float | None = None,
+        vix_cache_ttl_seconds: float | None = None,
     ) -> None:
         self._alpaca_client = alpaca_client
         self._ticker_factory = ticker_factory or yf.Ticker
         self._api_key = api_key
         self._secret_key = secret_key
+        # Enable in-memory TTL caching by default for live yfinance calls; disable for custom mock factories unless explicitly requested.
+        default_hist_ttl = 600.0 if ticker_factory is None else 0.0
+        default_vix_ttl = 120.0 if ticker_factory is None else 0.0
+        self._history_cache_ttl = (
+            default_hist_ttl if history_cache_ttl_seconds is None else max(0.0, float(history_cache_ttl_seconds))
+        )
+        self._vix_cache_ttl = (
+            default_vix_ttl if vix_cache_ttl_seconds is None else max(0.0, float(vix_cache_ttl_seconds))
+        )
+        self._cache_lock = threading.Lock()
+        self._history_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
+        self._vix_cache: tuple[float, float] | None = None
 
     def _get_alpaca_client(self) -> Any:
         """Return injected Alpaca client or lazily build one from env/credentials."""
@@ -422,16 +438,37 @@ class MarketDataClient:
         return quotes
 
     def get_historical_ohlcv(self, symbol: str, period: str = "1y") -> pd.DataFrame:
-        """Fetch historical OHLCV bars from yfinance."""
+        """Fetch historical OHLCV bars from yfinance with optional in-memory TTL caching."""
         norm_symbol = _normalize_symbol(symbol)
+        cache_key = (norm_symbol, period)
+        if self._history_cache_ttl > 0.0:
+            now_mono = time.monotonic()
+            with self._cache_lock:
+                cached = self._history_cache.get(cache_key)
+                if cached is not None and cached[0] > now_mono:
+                    return cached[1]
+
         ticker = self._ticker_factory(norm_symbol)
         history = ticker.history(period=period)
         if history is None or history.empty:
             raise ValueError(f"No yfinance historical data returned for {norm_symbol}")
+
+        if self._history_cache_ttl > 0.0:
+            with self._cache_lock:
+                self._history_cache[cache_key] = (
+                    time.monotonic() + self._history_cache_ttl,
+                    history,
+                )
         return history
 
     def get_vix(self) -> float:
         """Fetch the latest CBOE Volatility Index (^VIX) level via yfinance."""
+        if self._vix_cache_ttl > 0.0:
+            now_mono = time.monotonic()
+            with self._cache_lock:
+                if self._vix_cache is not None and self._vix_cache[0] > now_mono:
+                    return self._vix_cache[1]
+
         ticker = self._ticker_factory("^VIX")
         history = ticker.history(period="5d")
         if history is None or history.empty:
@@ -439,7 +476,11 @@ class MarketDataClient:
         closes = _extract_column(history, "Close")
         if closes.empty:
             raise ValueError("No valid Close prices returned for ^VIX")
-        return float(closes.iloc[-1])
+        vix_val = float(closes.iloc[-1])
+        if self._vix_cache_ttl > 0.0:
+            with self._cache_lock:
+                self._vix_cache = (time.monotonic() + self._vix_cache_ttl, vix_val)
+        return vix_val
 
     def get_technical_indicators(
         self,

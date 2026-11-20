@@ -460,7 +460,7 @@ def test_universe_screener_approves_healthy_liquid_uptrend_asset(tmp_path: Path)
     ("overrides", "expected_fragment"),
     [
         ({"alpaca_price": 210.0}, "Cross-price discrepancy"),
-        ({"volume": 100_000.0}, "Insufficient liquidity volume"),
+        ({"volume": 15_000.0}, "Insufficient liquidity volume"),
         ({"bid_price": 148.0, "ask_price": 152.0}, "Excessive bid/ask spread"),
         ({"fcf": -50_000_000.0}, "free cash flow"),
         ({"fcf": 0.0}, "free cash flow"),
@@ -669,3 +669,38 @@ def test_universe_screener_dual_iex_and_consolidated_liquidity(tmp_path: Path) -
         assert res.passed is True
     finally:
         store.close()
+
+
+def test_market_data_ttl_cache_and_morning_iex_run_rate_projection() -> None:
+    from src.universe.screener import _project_intraday_iex_volume
+
+    calls = 0
+
+    class _FakeTicker:
+        def history(self, period: str = "1y") -> pd.DataFrame:
+            nonlocal calls
+            calls += 1
+            return pd.DataFrame(
+                {"Close": [100.0, 101.0], "High": [101.0, 102.0], "Low": [99.0, 100.0], "Volume": [1e6, 1e6]}
+            )
+
+    md = MarketDataClient(
+        ticker_factory=lambda _sym: _FakeTicker(),
+        history_cache_ttl_seconds=60.0,
+        vix_cache_ttl_seconds=60.0,
+    )
+    md.get_historical_ohlcv("AAPL", period="1y")
+    md.get_historical_ohlcv("AAPL", period="1y")
+    assert calls == 1
+
+    md.get_vix()
+    md.get_vix()
+    assert calls == 2
+
+    # At 09:48 ET (18m into 390m session), 63,194 IEX volume projects to ~1.37M full-day run-rate
+    morning_ny = datetime(2026, 11, 20, 9, 48, tzinfo=NY_TIMEZONE)
+    projected = _project_intraday_iex_volume(63_194.0, morning_ny)
+    assert projected > 1_000_000.0
+    # After close (16:05 ET), volume is not scaled upward
+    after_close_ny = datetime(2026, 11, 20, 16, 5, tzinfo=NY_TIMEZONE)
+    assert _project_intraday_iex_volume(63_194.0, after_close_ny) == pytest.approx(63_194.0)

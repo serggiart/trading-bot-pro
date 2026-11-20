@@ -617,6 +617,30 @@ class AlpacaExecutionClient:
 
         rounded_stop = round(new_stop_price, 2)
         trading_client = self._require_trading_client()
+        is_stop_limit = False
+        if type(trading_client) is TradingClient:
+            try:
+                existing = trading_client.get_order_by_id(cleaned_order_id)
+                raw_type = getattr(existing, "type", getattr(existing, "order_type", ""))
+                type_val = str(getattr(raw_type, "value", raw_type)).lower()
+                is_stop_limit = "stop_limit" in type_val
+            except Exception:
+                is_stop_limit = False
+
+        if is_stop_limit:
+            limit_price = calculate_limit_sell_price(
+                reference_price=rounded_stop,
+                slippage_pct=self.config.exit_slippage_pct,
+            )
+            trading_client.replace_order_by_id(
+                order_id=cleaned_order_id,
+                order_data=ReplaceOrderRequest(
+                    stop_price=rounded_stop,
+                    limit_price=limit_price,
+                ),
+            )
+            return True
+
         replace_request = ReplaceOrderRequest(stop_price=rounded_stop)
         try:
             trading_client.replace_order_by_id(
@@ -737,6 +761,7 @@ class AlpacaExecutionClient:
         raw_positions = self._trading_client.get_all_positions() or []
 
         stop_orders_by_symbol: dict[str, tuple[str | None, float]] = {}
+        bracket_protected_symbols: set[str] = set()
         get_orders_fn = getattr(self._trading_client, "get_orders", None)
         if callable(get_orders_fn):
             open_orders = (
@@ -756,6 +781,15 @@ class AlpacaExecutionClient:
                         getattr(order, "order_type", getattr(order, "type", "")),
                     )
                 ).lower()
+                class_val = str(
+                    getattr(
+                        getattr(order, "order_class", ""),
+                        "value",
+                        getattr(order, "order_class", ""),
+                    )
+                ).lower()
+                if side_val == "sell" and class_val == "bracket":
+                    bracket_protected_symbols.add(sym)
                 raw_stop = getattr(order, "stop_price", None)
                 if side_val == "sell" and "stop" in type_val and raw_stop is not None:
                     stop_price = _to_float(raw_stop, default=0.0)
@@ -764,6 +798,41 @@ class AlpacaExecutionClient:
                     prev = stop_orders_by_symbol.get(sym)
                     if prev is None or stop_price > prev[1]:
                         stop_orders_by_symbol[sym] = (stop_id, stop_price)
+
+            # Bracket SELL STOP partner legs have status=HELD on Alpaca and are omitted from status=OPEN.
+            missing_bracket_stops = bracket_protected_symbols - set(stop_orders_by_symbol.keys())
+            if missing_bracket_stops and type(self._trading_client) is TradingClient:
+                recent_orders = (
+                    get_orders_fn(
+                        filter=GetOrdersRequest(status=QueryOrderStatus.ALL, limit=100)
+                    )
+                    or []
+                )
+                for order in recent_orders:
+                    sym = str(getattr(order, "symbol", "") or "").strip().upper()
+                    if sym not in missing_bracket_stops:
+                        continue
+                    status_val = _extract_broker_status(order, default="")
+                    if status_val not in {"held", "new", "accepted", "pending_new"}:
+                        continue
+                    side_val = str(
+                        getattr(getattr(order, "side", ""), "value", getattr(order, "side", ""))
+                    ).lower()
+                    type_val = str(
+                        getattr(
+                            getattr(order, "type", getattr(order, "order_type", "")),
+                            "value",
+                            getattr(order, "type", getattr(order, "order_type", "")),
+                        )
+                    ).lower()
+                    raw_stop = getattr(order, "stop_price", None)
+                    if side_val == "sell" and "stop" in type_val and raw_stop is not None:
+                        stop_price = _to_float(raw_stop, default=0.0)
+                        raw_id = getattr(order, "id", None)
+                        stop_id = str(raw_id) if raw_id is not None else None
+                        prev = stop_orders_by_symbol.get(sym)
+                        if prev is None or stop_price > prev[1]:
+                            stop_orders_by_symbol[sym] = (stop_id, stop_price)
 
         reconciled: list[ManagedPosition] = []
         active_symbols: set[str] = set()
@@ -835,7 +904,12 @@ class AlpacaExecutionClient:
                 else entry_price
             )
             stop_order_id = broker_stop_id or (stored.stop_order_id if stored is not None else None)
-            if ensure_protective_stops and broker_stop_id is None and current_stop > 0.0:
+            if (
+                ensure_protective_stops
+                and broker_stop_id is None
+                and symbol not in bracket_protected_symbols
+                and current_stop > 0.0
+            ):
                 current_mkt_price = _to_float(getattr(pos, "current_price", None), default=0.0)
                 if current_mkt_price <= 0.0 and qty > 0.0:
                     mkt_val = _to_float(getattr(pos, "market_value", None), default=0.0)

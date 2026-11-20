@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, time
 
 from src.universe.fmp import FmpClient
 from src.universe.market_data import MarketDataClient
-from src.universe.models import UniverseConfig, UniverseScreeningResult
+from src.universe.models import NY_TIMEZONE, MarketQuote, UniverseConfig, UniverseScreeningResult
+
+
+def _project_intraday_iex_volume(volume: float, now: datetime | None) -> float:
+    """Project cumulative intraday IEX volume to full-session run-rate during NY market hours."""
+    if volume <= 0.0 or now is None:
+        return volume
+    ny_now = now.replace(tzinfo=NY_TIMEZONE) if now.tzinfo is None else now.astimezone(NY_TIMEZONE)
+    if ny_now.weekday() >= 5:
+        return volume
+    open_dt = ny_now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_dt = ny_now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if not (open_dt <= ny_now < close_dt):
+        return volume
+    elapsed_minutes = (ny_now - open_dt).total_seconds() / 60.0
+    # Clamp minimum elapsed window to 15 minutes (~3.8% of 390m session) to avoid opening-minute spikes
+    fraction = max(elapsed_minutes, 15.0) / 390.0
+    return volume / fraction
 
 
 def _compute_setup_score(result: UniverseScreeningResult) -> float:
@@ -62,19 +79,20 @@ class UniverseScreener:
         symbol: str,
         now: datetime | None = None,
         vix: float | None = None,
+        quote: MarketQuote | None = None,
     ) -> UniverseScreeningResult:
         """Evaluate a single ticker against all Stage-1 universe screening rules."""
         norm_symbol = symbol.strip().upper()
         if not norm_symbol:
             raise ValueError("symbol must be a non-empty string")
 
-        quote = self.market_data.get_quote(norm_symbol)
+        resolved_quote = quote if quote is not None else self.market_data.get_quote(norm_symbol)
 
         if type(self.market_data) is MarketDataClient:
             history = self.market_data.get_historical_ohlcv(norm_symbol, period="1y")
             validation = self.market_data.validate_price(
                 norm_symbol,
-                alpaca_price=quote.price,
+                alpaca_price=resolved_quote.price,
                 sigma_threshold=self.config.outlier_sigma_threshold,
                 fallback_pct_threshold=self.config.fallback_pct_threshold,
                 history=history,
@@ -89,7 +107,7 @@ class UniverseScreener:
         else:
             validation = self.market_data.validate_price(
                 norm_symbol,
-                alpaca_price=quote.price,
+                alpaca_price=resolved_quote.price,
                 sigma_threshold=self.config.outlier_sigma_threshold,
                 fallback_pct_threshold=self.config.fallback_pct_threshold,
             )
@@ -110,17 +128,23 @@ class UniverseScreener:
                 or f"Cross-price discrepancy z={validation.z_score:.2f} exceeds {self.config.outlier_sigma_threshold:.2f}σ"
             )
 
-        if quote.bid_price <= 0.0 or quote.ask_price <= 0.0:
+        if resolved_quote.bid_price <= 0.0 or resolved_quote.ask_price <= 0.0:
             rejection_reasons.append("Invalid or missing bid/ask quote")
-        elif quote.spread_pct > self.config.max_spread_pct:
+        elif resolved_quote.spread_pct > self.config.max_spread_pct:
             rejection_reasons.append(
-                f"Excessive bid/ask spread: {quote.spread_pct:.4%} > {self.config.max_spread_pct:.4%}"
+                f"Excessive bid/ask spread: {resolved_quote.spread_pct:.4%} > {self.config.max_spread_pct:.4%}"
             )
 
         avg_vol_20d = float(getattr(indicators, "avg_volume_20d", 0.0) or 0.0)
-        if quote.volume < self.config.min_iex_volume:
+        effective_iex_volume = (
+            _project_intraday_iex_volume(resolved_quote.volume, now)
+            if type(self.market_data) is MarketDataClient
+            else resolved_quote.volume
+        )
+        if effective_iex_volume < self.config.min_iex_volume:
             rejection_reasons.append(
-                f"Insufficient liquidity volume (IEX): {quote.volume:,.0f} < {self.config.min_iex_volume:,.0f}"
+                f"Insufficient liquidity volume (IEX): {resolved_quote.volume:,.0f} "
+                f"(run-rate {effective_iex_volume:,.0f}) < {self.config.min_iex_volume:,.0f}"
             )
         elif avg_vol_20d > 0.0 and avg_vol_20d < self.config.min_avg_volume:
             rejection_reasons.append(
@@ -146,7 +170,7 @@ class UniverseScreener:
             symbol=norm_symbol,
             passed=len(rejection_reasons) == 0,
             rejection_reasons=rejection_reasons,
-            quote=quote,
+            quote=resolved_quote,
             validation=validation,
             indicators=indicators,
             fundamentals=fundamentals,

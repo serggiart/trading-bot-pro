@@ -6,10 +6,12 @@ import argparse
 import fcntl
 import inspect
 import logging
+import math
 import signal
 import threading
 import time as time_module
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
@@ -342,13 +344,25 @@ class TradingBotOrchestrator:
         price_lookup = {k.strip().upper(): float(v) for k, v in (current_prices or {}).items()}
         bid_lookup = {k.strip().upper(): float(v) for k, v in (bid_prices or {}).items()}
 
+        batched_quotes: dict[str, Any] = {}
+        missing_syms = [
+            pos.symbol.strip().upper()
+            for pos in open_positions
+            if pos.symbol.strip().upper() not in price_lookup
+        ]
+        if len(missing_syms) > 1 and type(self.screener.market_data) is MarketDataClient:
+            try:
+                batched_quotes = self.screener.market_data.get_quotes_batch(missing_syms)
+            except Exception as exc:
+                logger.warning("Batched quote fetch for open positions failed (%s); falling back", exc)
+
         for position in open_positions:
             symbol = position.symbol.strip().upper()
             current_price = price_lookup.get(symbol)
             bid_price = bid_lookup.get(symbol)
 
             if current_price is None:
-                quote = self.screener.market_data.get_quote(symbol)
+                quote = batched_quotes.get(symbol) or self.screener.market_data.get_quote(symbol)
                 current_price = quote.price
                 if bid_price is None and quote.bid_price > 0.0:
                     bid_price = quote.bid_price
@@ -426,6 +440,7 @@ class TradingBotOrchestrator:
         current_volumes: Mapping[str, float],
         avg_volumes_20d: Mapping[str, float],
         pre_screened: UniverseScreeningResult | None = None,
+        available_capital: float | None = None,
     ) -> TickerPipelineOutcome:
         """Run a single symbol sequentially through stages 1-5 of the decision funnel."""
         # Stage 1: Universe screening
@@ -634,9 +649,27 @@ class TradingBotOrchestrator:
                 ask_price + self.take_profit_atr_multiplier * indicators.atr_14,
                 2,
             )
+        order_shares = decision.recommended_shares
+        if available_capital is not None:
+            affordable = math.floor(max(0.0, available_capital) / ask_price) if ask_price > 0.0 else 0
+            order_shares = min(order_shares, affordable)
+            if order_shares <= 0:
+                return TickerPipelineOutcome(
+                    symbol=symbol,
+                    stage_reached="cash_prefilter",
+                    status="skipped_insufficient_cash",
+                    approved=False,
+                    reasons=[
+                        f"Insufficient cash (${available_capital:,.2f}) for {symbol} at ${ask_price:,.2f} (margin disabled)"
+                    ],
+                    screening_result=screening,
+                    analyst_result=analyst_result,
+                    guardian_decision=decision,
+                )
+
         order_result = self.execution_client.submit_limit_buy(
             symbol=symbol,
-            qty=decision.recommended_shares,
+            qty=order_shares,
             ask_price=ask_price,
             stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,
@@ -685,23 +718,27 @@ class TradingBotOrchestrator:
         starting_equity: float,
         daily_pnl: float,
         portfolio_positions: Sequence[PortfolioPosition],
-    ) -> tuple[float, float, Sequence[PortfolioPosition]]:
-        """Sync live/paper equity, daily PnL, and open positions from the broker for compounding."""
+    ) -> tuple[float, float, list[PortfolioPosition], float | None]:
+        """Sync live/paper equity, daily PnL, open positions, and available cash from the broker."""
         snapshot = self.execution_client.get_account_snapshot()
         resolved_equity = starting_equity
         resolved_pnl = daily_pnl
+        available_cash: float | None = None
         if snapshot is not None:
             raw_last_equity = getattr(snapshot, "last_equity", None)
             raw_equity = getattr(snapshot, "equity", None)
             raw_daily_pnl = getattr(snapshot, "daily_pnl", None)
+            raw_cash = getattr(snapshot, "cash", None)
             if isinstance(raw_last_equity, (int, float)) and raw_last_equity > 0.0:
                 resolved_equity = float(raw_last_equity)
             elif isinstance(raw_equity, (int, float)) and raw_equity > 0.0:
                 resolved_equity = float(raw_equity)
             if isinstance(raw_daily_pnl, (int, float)):
                 resolved_pnl = float(raw_daily_pnl)
+            if isinstance(raw_cash, (int, float)) and math.isfinite(float(raw_cash)):
+                available_cash = float(raw_cash)
 
-        resolved_positions = portfolio_positions
+        resolved_positions = list(portfolio_positions)
         synced_positions = self.execution_client.get_open_positions()
         if isinstance(synced_positions, Sequence):
             if synced_positions:
@@ -718,7 +755,7 @@ class TradingBotOrchestrator:
             elif snapshot is not None:
                 resolved_positions = []
 
-        return resolved_equity, resolved_pnl, resolved_positions
+        return resolved_equity, resolved_pnl, resolved_positions, available_cash
 
     def _resolve_correlation_matrix(
         self,
@@ -788,11 +825,18 @@ class TradingBotOrchestrator:
                 dry_run=dry_run,
             )
 
+        remaining_cash: float | None = None
+        active_portfolio: list[PortfolioPosition] = list(portfolio_positions)
         if sync_account:
-            starting_equity, daily_pnl, portfolio_positions = self._sync_broker_account_state(
+            (
+                starting_equity,
+                daily_pnl,
+                active_portfolio,
+                remaining_cash,
+            ) = self._sync_broker_account_state(
                 starting_equity=starting_equity,
                 daily_pnl=daily_pnl,
-                portfolio_positions=portfolio_positions,
+                portfolio_positions=active_portfolio,
             )
             if not open_positions:
                 reconcile_fn = getattr(self.execution_client, "reconcile_managed_positions", None)
@@ -833,10 +877,36 @@ class TradingBotOrchestrator:
             k.strip().upper(): float(v) for k, v in (avg_volumes_20d or {}).items()
         }
         cleaned_symbols = [raw.strip().upper() for raw in symbols if raw.strip()]
+
+        # Cash-only guard: skip new entry scanning when broker cash is exhausted (no margin buying)
+        if remaining_cash is not None and remaining_cash < 100.0:
+            cash_reason = (
+                f"Insufficient available cash (${remaining_cash:,.2f} < $100.00; "
+                "margin disabled — monitoring open positions only)"
+            )
+            logger.info("%s", cash_reason)
+            return PipelineCycleReport(
+                timestamp=now_ny,
+                market_open=market_open,
+                skipped=False,
+                dry_run=dry_run,
+                exit_results=exit_results,
+                ticker_outcomes=[
+                    TickerPipelineOutcome(
+                        symbol=sym,
+                        stage_reached="cash_prefilter",
+                        status="skipped_insufficient_cash",
+                        approved=False,
+                        reasons=[cash_reason],
+                    )
+                    for sym in cleaned_symbols
+                ],
+            )
+
         resolved_corr: Mapping[tuple[str, str], float] | Mapping[str, float] = (
             correlation_matrix
             if correlation_matrix is not None
-            else self._resolve_correlation_matrix(cleaned_symbols, portfolio_positions)
+            else self._resolve_correlation_matrix(cleaned_symbols, active_portfolio)
         )
         resolved_fed_dates = fed_dates if fed_dates else self.default_fed_dates
 
@@ -852,7 +922,7 @@ class TradingBotOrchestrator:
 
         held_symbols = {
             pos.symbol.strip().upper()
-            for pos in portfolio_positions
+            for pos in active_portfolio
             if getattr(pos, "symbol", None)
         }
         vix_blocked_reason: str | None = None
@@ -877,6 +947,7 @@ class TradingBotOrchestrator:
                 fed_blackout_reason = f"{fed_check.reason} (skipped LLM call)"
 
         if len(cleaned_symbols) > 1 and self.max_candidates_for_ai > 0:
+            symbols_to_screen: list[str] = []
             for symbol in cleaned_symbols:
                 if self.skip_ai_on_prefilter_fail and symbol in held_symbols:
                     prefiltered_skip_outcomes[symbol] = TickerPipelineOutcome(
@@ -905,18 +976,60 @@ class TradingBotOrchestrator:
                         reasons=[fed_blackout_reason],
                     )
                     continue
+                symbols_to_screen.append(symbol)
+
+            # Batch-fetch Alpaca IEX snapshots and warm yfinance histories concurrently
+            batched_screen_quotes: dict[str, Any] = {}
+            if (
+                symbols_to_screen
+                and type(self.screener) is UniverseScreener
+                and type(self.screener.market_data) is MarketDataClient
+            ):
                 try:
+                    batched_screen_quotes = self.screener.market_data.get_quotes_batch(
+                        symbols_to_screen
+                    )
+                except Exception as exc:
+                    logger.warning("Batched universe quote fetch failed (%s); falling back", exc)
+
+                def _warm_history(sym: str) -> None:
+                    try:
+                        self.screener.market_data.get_historical_ohlcv(sym, period="1y")
+                    except Exception:
+                        pass
+
+                with ThreadPoolExecutor(max_workers=min(6, len(symbols_to_screen))) as pool:
+                    list(pool.map(_warm_history, symbols_to_screen))
+
+            for symbol in symbols_to_screen:
+                try:
+                    prefetched_quote = batched_screen_quotes.get(symbol)
                     if shared_vix is not None:
-                        pre_screened_map[symbol] = self.screener.screen_symbol(
-                            symbol,
-                            now=now_ny,
-                            vix=shared_vix,
-                        )
+                        if prefetched_quote is not None:
+                            pre_screened_map[symbol] = self.screener.screen_symbol(
+                                symbol,
+                                now=now_ny,
+                                vix=shared_vix,
+                                quote=prefetched_quote,
+                            )
+                        else:
+                            pre_screened_map[symbol] = self.screener.screen_symbol(
+                                symbol,
+                                now=now_ny,
+                                vix=shared_vix,
+                            )
                     else:
-                        pre_screened_map[symbol] = self.screener.screen_symbol(
-                            symbol,
-                            now=now_ny,
-                        )
+                        if prefetched_quote is not None:
+                            pre_screened_map[symbol] = self.screener.screen_symbol(
+                                symbol,
+                                now=now_ny,
+                                quote=prefetched_quote,
+                            )
+                        else:
+                            pre_screened_map[symbol] = self.screener.screen_symbol(
+                                symbol,
+                                now=now_ny,
+                            )
                 except Exception as exc:
                     logger.exception("Error pre-screening symbol %s: %s", symbol, exc)
                     pre_screen_errors[symbol] = str(exc)
@@ -1058,7 +1171,7 @@ class TradingBotOrchestrator:
                     now_ny=now_ny,
                     shared_vix=shared_vix,
                     dry_run=dry_run,
-                    portfolio_positions=portfolio_positions,
+                    portfolio_positions=active_portfolio,
                     correlation_matrix=resolved_corr,
                     starting_equity=starting_equity,
                     daily_pnl=daily_pnl,
@@ -1067,6 +1180,7 @@ class TradingBotOrchestrator:
                     current_volumes=normalized_cur_vols,
                     avg_volumes_20d=normalized_avg_vols,
                     pre_screened=pre_screened,
+                    available_capital=remaining_cash,
                 )
             except Exception as exc:
                 logger.exception("Error processing symbol %s: %s", symbol, exc)
@@ -1076,6 +1190,19 @@ class TradingBotOrchestrator:
                     status="error",
                     approved=False,
                     reasons=[str(exc)],
+                )
+            if outcome.approved and outcome.order_result is not None:
+                spent = float(outcome.order_result.qty) * float(outcome.order_result.limit_price)
+                if remaining_cash is not None:
+                    remaining_cash = max(0.0, remaining_cash - spent)
+                active_portfolio.append(
+                    PortfolioPosition(
+                        symbol=symbol,
+                        sector=self.sector_map.get(symbol, self.default_sector),
+                        market_value=spent,
+                        shares=float(outcome.order_result.qty),
+                        avg_price=float(outcome.order_result.limit_price),
+                    )
                 )
             outcomes.append(outcome)
 

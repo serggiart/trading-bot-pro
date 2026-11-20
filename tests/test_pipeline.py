@@ -1438,3 +1438,41 @@ def test_orchestrator_skips_ai_for_held_symbols_and_earnings_blackout_and_fast_s
     assert rc == 0
     assert elapsed < 2.0
     store.close()
+
+
+def test_orchestrator_cash_only_guard_prevents_margin_and_skips_scanning(tmp_path: Path) -> None:
+    from src.execution.models import AccountSnapshot
+
+    now_ny = datetime(2026, 11, 20, 10, 15, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "cash_guard.db")
+    orch, mocks = _build_mock_orchestrator(
+        audit_store=store,
+        screening_result=_make_screening_result("AAPL", vix=18.0),
+        news_items=[_make_news(now_ny - timedelta(minutes=10), source="Reuters")],
+        analyst_result=_make_analyst_result("AAPL", approved=True),
+    )
+    # Simulate account with negative/exhausted cash (margin available, cash < $100)
+    mocks["execution_client"].get_account_snapshot.return_value = AccountSnapshot(
+        equity=100_000.0,
+        cash=-5_000.0,
+        buying_power=50_000.0,
+        last_equity=100_000.0,
+        daily_pnl=0.0,
+    )
+    mocks["execution_client"].get_open_positions.return_value = []
+    mocks["execution_client"].reconcile_managed_positions.return_value = []
+
+    report = orch.run_cycle(
+        symbols=["AAPL", "MSFT"],
+        now=now_ny,
+        dry_run=False,
+        sync_account=True,
+    )
+
+    assert len(report.ticker_outcomes) == 2
+    assert all(o.status == "skipped_insufficient_cash" for o in report.ticker_outcomes)
+    mocks["screener"].screen_symbol.assert_not_called()
+    mocks["news_aggregator"].fetch_news.assert_not_called()
+    mocks["analyst"].evaluate.assert_not_called()
+    mocks["execution_client"].submit_limit_buy.assert_not_called()
+    store.close()
