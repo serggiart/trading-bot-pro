@@ -37,7 +37,7 @@ from src.guardian import (
     TradeCandidate,
     check_economic_calendar,
 )
-from src.notifications import TelegramNotifier
+from src.notifications import CompositeNotifier, EmailNotifier, TelegramNotifier
 from src.storage import DEFAULT_DB_PATH, TradingAuditStore
 from src.universe import (
     FmpClient,
@@ -386,13 +386,35 @@ class TradingBotOrchestrator:
                         if result.order_result is not None
                         else bid_price
                     )
-                    self.notifier.notify_position_closed(
-                        symbol=symbol,
-                        action=result.action,
-                        qty=position.qty,
-                        limit_price=limit_price,
-                        reason=result.exit_reason or result.action,
-                    )
+                    close_fn = self.notifier.notify_position_closed
+                    try:
+                        sig = inspect.signature(close_fn)
+                        if "entry_price" in sig.parameters:
+                            close_fn(
+                                symbol=symbol,
+                                action=result.action,
+                                qty=position.qty,
+                                limit_price=limit_price,
+                                reason=result.exit_reason or result.action,
+                                entry_price=position.entry_price,
+                                dry_run=dry_run,
+                            )
+                        else:
+                            close_fn(
+                                symbol=symbol,
+                                action=result.action,
+                                qty=position.qty,
+                                limit_price=limit_price,
+                                reason=result.exit_reason or result.action,
+                            )
+                    except (TypeError, ValueError):
+                        close_fn(
+                            symbol=symbol,
+                            action=result.action,
+                            qty=position.qty,
+                            limit_price=limit_price,
+                            reason=result.exit_reason or result.action,
+                        )
             except Exception as exc:
                 logger.exception("Error managing open position %s: %s", symbol, exc)
                 if hasattr(self.notifier, "send_message"):
@@ -1301,6 +1323,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Sync live/paper Alpaca account equity, daily PnL, and open positions for compounding",
     )
+    parser.add_argument(
+        "--test-email",
+        action="store_true",
+        help="Send a sample HTML 'Good News' trade notification email via Gmail SMTP and exit",
+    )
 
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.interval_seconds <= 0:
@@ -1385,6 +1412,7 @@ def _build_orchestrator_from_settings(
     exec_config = ExecutionConfig(
         trailing_atr_multiplier=settings.trailing_atr_multiplier,
         take_profit_atr_multiplier=settings.atr_take_profit_multiplier,
+        enable_take_profit_exit=settings.atr_take_profit_multiplier > 0.0,
         max_hold_hours=settings.max_hold_hours,
         min_target_return_pct=settings.min_target_return_pct,
     )
@@ -1409,6 +1437,7 @@ def _build_orchestrator_from_settings(
         execution_client=execution_client,
         position_manager=position_manager,
         audit_store=audit_store,
+        notifier=CompositeNotifier(),
         confirmation_delay_minutes=settings.confirmation_delay_minutes,
         max_confirmation_delay_minutes=settings.max_confirmation_delay_minutes,
         default_sector=settings.default_sector,
@@ -1538,6 +1567,25 @@ def main(
         if args.max_candidates is not None
         else settings.max_candidates_for_ai
     )
+
+    if args.test_email:
+        email_notifier = EmailNotifier()
+        ok = email_notifier.notify_position_closed(
+            symbol="JNJ",
+            action="TAKE_PROFIT_EXIT",
+            qty=73,
+            limit_price=272.25,
+            reason="Prueba de plantilla HTML — Objetivo de ganancia alcanzado",
+            entry_price=266.74,
+            dry_run=True,
+        )
+        if ok:
+            logger.info("Sample HTML email sent successfully to %s", email_notifier.recipient_email)
+            return 0
+        logger.error(
+            "Could not send sample email. Verify SMTP_USER, SMTP_APP_PASSWORD, and EMAIL_RECIPIENT in .env"
+        )
+        return 1
 
     if args.backtest:
         return _run_backtest_cli(

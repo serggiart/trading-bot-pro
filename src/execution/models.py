@@ -28,6 +28,7 @@ class ExecutionConfig:
     emergency_slippage_pct: float = 0.015
     trailing_atr_multiplier: float = 2.0
     take_profit_atr_multiplier: float = 2.0
+    enable_take_profit_exit: bool = False
     max_hold_hours: float = 72.0
     min_target_return_pct: float = 0.01
     flash_crash_window_minutes: float = 5.0
@@ -112,6 +113,7 @@ ExitAction = Literal[
     "HOLD",
     "TRAIL_UPDATE",
     "TIME_EXIT",
+    "TAKE_PROFIT_EXIT",
     "TRAILING_STOP_EXIT",
     "EMERGENCY_EXIT",
 ]

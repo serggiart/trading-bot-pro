@@ -256,6 +256,50 @@ class PositionManager:
                 order_result=order_result,
             )
 
+        # 2b. Take-Profit Target Exit (protects standalone STOP_LIMIT positions without bracket TP leg)
+        if (
+            self.config.enable_take_profit_exit
+            and self.config.take_profit_atr_multiplier > 0.0
+            and position.atr_14 > 0.0
+        ):
+            target_price = round(
+                position.entry_price
+                + self.config.take_profit_atr_multiplier * position.atr_14,
+                2,
+            )
+            if current_price >= target_price:
+                gain_pct = (current_price - position.entry_price) / position.entry_price
+                reason = (
+                    f"Take-profit target reached: current_price {current_price:.2f} "
+                    f">= target {target_price:.2f} (+{gain_pct:.2%})"
+                )
+                tp_metadata: dict[str, Any] = {
+                    "exit_type": "TAKE_PROFIT_EXIT",
+                    "entry_price": position.entry_price,
+                    "target_price": target_price,
+                    "current_price": current_price,
+                    "return_pct": round(gain_pct, 6),
+                    "dry_run": dry_run,
+                }
+                order_result = self.execution_client.submit_limit_sell(
+                    symbol=position.symbol,
+                    qty=position.qty,
+                    reference_price=reference_price,
+                    slippage_pct=self.config.exit_slippage_pct,
+                    dry_run=dry_run,
+                    reason=reason,
+                    metadata=tp_metadata,
+                )
+                self._mirror_order_to_local_store(order_result, tp_metadata, eval_now)
+                return ExitEvaluationResult(
+                    symbol=position.symbol,
+                    action="TAKE_PROFIT_EXIT",
+                    should_exit=True,
+                    new_stop_price=position.current_stop_price,
+                    exit_reason=reason,
+                    order_result=order_result,
+                )
+
         # 3. Time-Window Exit (Opportunity Cost Guard)
         if is_time_window_expired(
             entry_price=position.entry_price,

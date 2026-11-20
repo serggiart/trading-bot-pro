@@ -206,3 +206,133 @@ def test_reconcile_cleans_closed_positions_and_updates_partial_fills_plus_proces
             with ProcessLock(lock_path):
                 pass
     store.close()
+
+
+def test_email_notifier_html_good_news_protective_exit_and_veto_dedup() -> None:
+    from src.notifications import CompositeNotifier, EmailNotifier
+
+    sent_messages: list[tuple[str, list[str], str]] = []
+
+    class _FakeSmtp:
+        def __init__(self, host: str, port: int, timeout: float = 15.0) -> None:
+            self.host = host
+            self.port = port
+
+        def __enter__(self) -> _FakeSmtp:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def login(self, user: str, password: str) -> None:
+            assert user == "bot@example.com"
+            assert password == "abcd-efgh-ijkl-mnop"
+
+        def sendmail(self, from_addr: str, to_addrs: list[str], raw_msg: str) -> None:
+            sent_messages.append((from_addr, to_addrs, raw_msg))
+
+    notifier = EmailNotifier(
+        smtp_user="bot@example.com",
+        smtp_app_password="abcd-efgh-ijkl-mnop",
+        recipient_email="user@example.com",
+        smtp_factory=_FakeSmtp,
+    )
+    composite = CompositeNotifier(email_notifier=notifier)
+
+    # 1) Buy -> Good News green card
+    import email as email_pkg
+
+    def _decode_mime(raw: str) -> str:
+        parsed = email_pkg.message_from_string(raw)
+        return "\n".join(
+            part.get_payload(decode=True).decode("utf-8")
+            for part in parsed.walk()
+            if part.get_payload(decode=True) is not None
+        )
+
+    assert composite.notify_trade_executed(
+        symbol="JNJ", side="BUY", qty=73, limit_price=266.74, stop_price=253.13
+    ) is True
+    assert len(sent_messages) == 1
+    assert "16a34a" in _decode_mime(sent_messages[-1][2])  # Green good-news header
+
+    # 2) Profitable exit -> Good News realized profit card (+$402.23 / +2.07%)
+    assert composite.notify_position_closed(
+        symbol="JNJ",
+        action="TRAILING_STOP_EXIT",
+        qty=73,
+        limit_price=272.25,
+        reason="Trailing stop locked profit",
+        entry_price=266.74,
+    ) is True
+    assert len(sent_messages) == 2
+    assert "402.23" in _decode_mime(sent_messages[-1][2])
+
+    # 3) Controlled loss exit -> Yellow protective card
+    assert composite.notify_position_closed(
+        symbol="DIS",
+        action="TIME_EXIT",
+        qty=100,
+        limit_price=119.00,
+        reason="Time window expired",
+        entry_price=121.29,
+    ) is True
+    assert len(sent_messages) == 3
+    assert "ca8a04" in _decode_mime(sent_messages[-1][2])
+
+    # 4) Guardian veto deduplicates repeated same-day vetoes per symbol
+    assert composite.notify_guardian_veto("WMT", ["Earnings in 0.00h"], vix=24.5) is True
+    assert composite.notify_guardian_veto("WMT", ["Earnings in 0.00h"], vix=24.5) is False
+    assert len(sent_messages) == 4
+
+
+def test_position_manager_software_take_profit_exit(tmp_path: Path) -> None:
+    now_ny = datetime(2026, 11, 20, 14, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "tp_exit.db")
+    mock_exec = MagicMock()
+    mock_exec.audit_store = store
+    mock_exec.config = ExecutionConfig(
+        trailing_atr_multiplier=2.5,
+        take_profit_atr_multiplier=5.0,
+        enable_take_profit_exit=True,
+    )
+    mock_exec.submit_limit_sell.return_value = SimpleNamespace(
+        submitted=True,
+        client_order_id="tp-ko-1",
+        broker_order_id="brk-tp-ko-1",
+        symbol="KO",
+        side="SELL",
+        qty=200.0,
+        limit_price=104.68,
+        stop_price=None,
+        order_type="limit",
+        status="accepted",
+        reason="Take-profit target reached",
+    )
+
+    pm = PositionManager(
+        execution_client=mock_exec,
+        audit_store=store,
+        config=mock_exec.config,
+    )
+    pos = ManagedPosition(
+        symbol="KO",
+        qty=200.0,
+        entry_price=95.00,
+        current_stop_price=92.00,
+        atr_14=2.00,
+        opened_at=now_ny - timedelta(hours=24),
+        stop_order_id="gtc-stop-ko",
+    )
+    # Target = 95.00 + 5.0 * 2.00 = 105.00
+    res = pm.evaluate_and_manage(
+        pos,
+        current_price=105.20,
+        bid_price=105.00,
+        now=now_ny,
+        dry_run=False,
+    )
+    assert res.action == "TAKE_PROFIT_EXIT"
+    assert res.should_exit is True
+    mock_exec.submit_limit_sell.assert_called_once()
+    store.close()
