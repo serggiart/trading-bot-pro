@@ -6,7 +6,7 @@ import os
 import uuid
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from alpaca.trading.client import TradingClient
@@ -762,6 +762,7 @@ class AlpacaExecutionClient:
 
         stop_orders_by_symbol: dict[str, tuple[str | None, float]] = {}
         bracket_protected_symbols: set[str] = set()
+        recent_buy_filled_at: dict[str, datetime] = {}
         get_orders_fn = getattr(self._trading_client, "get_orders", None)
         if callable(get_orders_fn):
             open_orders = (
@@ -800,8 +801,15 @@ class AlpacaExecutionClient:
                         stop_orders_by_symbol[sym] = (stop_id, stop_price)
 
             # Bracket SELL STOP partner legs have status=HELD on Alpaca and are omitted from status=OPEN.
+            recent_buy_filled_at: dict[str, datetime] = {}
             missing_bracket_stops = bracket_protected_symbols - set(stop_orders_by_symbol.keys())
-            if missing_bracket_stops and type(self._trading_client) is TradingClient:
+            need_cold_fill_lookup = any(
+                str(getattr(p, "symbol", "") or "").strip().upper() not in stored_by_symbol
+                for p in raw_positions
+            )
+            if (missing_bracket_stops or need_cold_fill_lookup) and type(
+                self._trading_client
+            ) is TradingClient:
                 recent_orders = (
                     get_orders_fn(
                         filter=GetOrdersRequest(status=QueryOrderStatus.ALL, limit=100)
@@ -810,14 +818,26 @@ class AlpacaExecutionClient:
                 )
                 for order in recent_orders:
                     sym = str(getattr(order, "symbol", "") or "").strip().upper()
-                    if sym not in missing_bracket_stops:
+                    if not sym:
                         continue
                     status_val = _extract_broker_status(order, default="")
-                    if status_val not in {"held", "new", "accepted", "pending_new"}:
-                        continue
                     side_val = str(
                         getattr(getattr(order, "side", ""), "value", getattr(order, "side", ""))
                     ).lower()
+                    if (
+                        side_val == "buy"
+                        and status_val in _FILLED_ORDER_STATUSES
+                        and sym not in recent_buy_filled_at
+                    ):
+                        raw_ts = getattr(order, "filled_at", None) or getattr(
+                            order, "submitted_at", None
+                        )
+                        if isinstance(raw_ts, datetime):
+                            recent_buy_filled_at[sym] = ensure_ny_datetime(raw_ts)
+                    if sym not in missing_bracket_stops:
+                        continue
+                    if status_val not in {"held", "new", "accepted", "pending_new"}:
+                        continue
                     type_val = str(
                         getattr(
                             getattr(order, "type", getattr(order, "order_type", "")),
@@ -893,10 +913,20 @@ class AlpacaExecutionClient:
                     2,
                 )
 
+            # When recovering an unknown pre-existing holding cold (no local DB history and no
+            # broker fill timestamp), backdate opened_at past the 5-minute flash-crash window so
+            # an existing swing drawdown never triggers a false flash-crash emergency sell.
+            cold_fallback_opened = now_ny - timedelta(
+                minutes=max(15.0, self.config.flash_crash_window_minutes + 10.0)
+            )
             opened_at = (
                 stored.opened_at
                 if stored is not None
-                else (recent_buy_order.created_at if recent_buy_order is not None else now_ny)
+                else (
+                    recent_buy_order.created_at
+                    if recent_buy_order is not None
+                    else recent_buy_filled_at.get(symbol, cold_fallback_opened)
+                )
             )
             highest_price = (
                 max(entry_price, stored.highest_price)

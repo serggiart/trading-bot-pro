@@ -14,6 +14,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY main.py ./
 COPY config/strategy.example.json ./config/strategy.example.json
+COPY config/fed_calendar.json ./config/fed_calendar.json
 
 RUN pip install --upgrade pip \
     && pip install . \
@@ -25,4 +26,4 @@ USER botuser
 HEALTHCHECK --interval=60s --timeout=10s --start-period=20s --retries=3 \
     CMD python -c "import sqlite3; sqlite3.connect('/app/data/trading_audit.db').execute('SELECT 1')" || exit 1
 
-CMD ["python", "main.py", "--loop", "--interval-seconds", "60", "--sync-account"]
+CMD ["python", "main.py", "--loop", "--interval-seconds", "300", "--sync-account"]

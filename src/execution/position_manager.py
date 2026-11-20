@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -14,6 +15,9 @@ from src.execution.models import (
     ensure_ny_datetime,
 )
 from src.storage import TradingAuditStore
+
+logger = logging.getLogger(__name__)
+_STALE_STOP_ERROR_TOKENS = ("404", "not found", "canceled", "cancelled", "expired", "filled", "replaced")
 
 
 def compute_trailing_stop(
@@ -312,11 +316,23 @@ class PositionManager:
 
         if new_stop > position.current_stop_price:
             if position.stop_order_id:
-                self.execution_client.update_stop_order(
-                    stop_order_id=position.stop_order_id,
-                    new_stop_price=new_stop,
-                    dry_run=dry_run,
-                )
+                try:
+                    self.execution_client.update_stop_order(
+                        stop_order_id=position.stop_order_id,
+                        new_stop_price=new_stop,
+                        dry_run=dry_run,
+                    )
+                except Exception as exc:
+                    err_text = str(exc).lower()
+                    logger.warning(
+                        "Failed to replace broker stop %s for %s (%s); keeping local trailing stop %.2f active",
+                        position.stop_order_id,
+                        position.symbol,
+                        exc,
+                        new_stop,
+                    )
+                    if any(token in err_text for token in _STALE_STOP_ERROR_TOKENS):
+                        position.stop_order_id = None
             position.current_stop_price = new_stop
             if not dry_run and self.audit_store is not None:
                 self.audit_store.upsert_position_state(

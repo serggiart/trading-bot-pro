@@ -358,40 +358,47 @@ class TradingBotOrchestrator:
 
         for position in open_positions:
             symbol = position.symbol.strip().upper()
-            current_price = price_lookup.get(symbol)
-            bid_price = bid_lookup.get(symbol)
+            try:
+                current_price = price_lookup.get(symbol)
+                bid_price = bid_lookup.get(symbol)
 
-            if current_price is None:
-                quote = batched_quotes.get(symbol) or self.screener.market_data.get_quote(symbol)
-                current_price = quote.price
-                if bid_price is None and quote.bid_price > 0.0:
-                    bid_price = quote.bid_price
+                if current_price is None:
+                    quote = batched_quotes.get(symbol) or self.screener.market_data.get_quote(symbol)
+                    current_price = quote.price
+                    if bid_price is None and quote.bid_price > 0.0:
+                        bid_price = quote.bid_price
 
-            if bid_price is None:
-                bid_price = current_price
+                if bid_price is None:
+                    bid_price = current_price
 
-            result = self.position_manager.evaluate_and_manage(
-                position,
-                current_price=current_price,
-                bid_price=bid_price,
-                now=now_ny,
-                dry_run=dry_run,
-            )
-            exit_results.append(result)
-
-            if result.should_exit:
-                limit_price = (
-                    result.order_result.limit_price
-                    if result.order_result is not None
-                    else bid_price
+                result = self.position_manager.evaluate_and_manage(
+                    position,
+                    current_price=current_price,
+                    bid_price=bid_price,
+                    now=now_ny,
+                    dry_run=dry_run,
                 )
-                self.notifier.notify_position_closed(
-                    symbol=symbol,
-                    action=result.action,
-                    qty=position.qty,
-                    limit_price=limit_price,
-                    reason=result.exit_reason or result.action,
-                )
+                exit_results.append(result)
+
+                if result.should_exit:
+                    limit_price = (
+                        result.order_result.limit_price
+                        if result.order_result is not None
+                        else bid_price
+                    )
+                    self.notifier.notify_position_closed(
+                        symbol=symbol,
+                        action=result.action,
+                        qty=position.qty,
+                        limit_price=limit_price,
+                        reason=result.exit_reason or result.action,
+                    )
+            except Exception as exc:
+                logger.exception("Error managing open position %s: %s", symbol, exc)
+                if hasattr(self.notifier, "send_message"):
+                    self.notifier.send_message(
+                        f"POSITION MANAGEMENT ERROR ({symbol}): {exc}"
+                    )
 
         return exit_results
 
