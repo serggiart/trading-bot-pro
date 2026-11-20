@@ -21,6 +21,11 @@ class BacktestConfig:
     rsi_entry_max: float = 60.0
     min_relative_volume: float = 1.2
     default_vix: float = 18.0
+    max_stop_loss_pct: float = 0.0
+    max_ema_extension_atr: float = 0.0
+    breakeven_trigger_pct: float = 0.0
+    peak_activation_pct: float = 0.0
+    peak_rsi_threshold: float = 66.0
     cache_dir: Path = Path("data/candles")
 
     def __post_init__(self) -> None:
@@ -40,6 +45,16 @@ class BacktestConfig:
             raise ValueError("min_relative_volume must be non-negative")
         if self.default_vix < 0.0:
             raise ValueError("default_vix must be non-negative")
+        if not 0.0 <= self.max_stop_loss_pct < 1.0:
+            raise ValueError("max_stop_loss_pct must be in [0.0, 1.0)")
+        if self.max_ema_extension_atr < 0.0:
+            raise ValueError("max_ema_extension_atr must be non-negative")
+        if not 0.0 <= self.breakeven_trigger_pct < 1.0:
+            raise ValueError("breakeven_trigger_pct must be in [0.0, 1.0)")
+        if not 0.0 <= self.peak_activation_pct < 1.0:
+            raise ValueError("peak_activation_pct must be in [0.0, 1.0)")
+        if not 0.0 < self.peak_rsi_threshold <= 100.0:
+            raise ValueError("peak_rsi_threshold must be in (0.0, 100.0]")
 
 
 @dataclass(frozen=True, slots=True)

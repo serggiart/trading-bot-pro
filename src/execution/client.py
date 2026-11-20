@@ -133,6 +133,7 @@ class AlpacaExecutionClient:
         self.config = replace(base_config, paper=resolved_paper)
         self.paper = resolved_paper
         self.audit_store = audit_store
+        self.last_broker_closed_positions: list[dict[str, Any]] = []
 
         self._api_key = api_key if api_key is not None else os.getenv("ALPACA_API_KEY")
         self._secret_key = (
@@ -730,6 +731,7 @@ class AlpacaExecutionClient:
     ) -> list[ManagedPosition]:
         """Reconstruct crash-safe ManagedPositions from broker state and SQLite position_state."""
         now_ny = ensure_ny_datetime(now)
+        self.last_broker_closed_positions = []
         normalized_atr = {
             k.strip().upper(): float(v)
             for k, v in (atr_lookup or {}).items()
@@ -993,7 +995,72 @@ class AlpacaExecutionClient:
             )
 
         if self.audit_store is not None:
-            for stale_symbol in set(stored_by_symbol.keys()) - active_symbols:
+            stale_symbols = sorted(set(stored_by_symbol.keys()) - active_symbols)
+            broker_sell_fills: dict[str, tuple[float, str]] = {}
+            if stale_symbols and callable(get_orders_fn):
+                try:
+                    closed_orders = (
+                        get_orders_fn(
+                            filter=GetOrdersRequest(status=QueryOrderStatus.ALL, limit=100)
+                        )
+                        or []
+                    )
+                    for order in closed_orders:
+                        sym = str(getattr(order, "symbol", "") or "").strip().upper()
+                        if sym not in stale_symbols or sym in broker_sell_fills:
+                            continue
+                        status_val = _extract_broker_status(order, default="")
+                        side_val = str(
+                            getattr(
+                                getattr(order, "side", ""),
+                                "value",
+                                getattr(order, "side", ""),
+                            )
+                        ).lower()
+                        if side_val == "sell" and status_val in _FILLED_ORDER_STATUSES:
+                            fill_p = _to_float(
+                                getattr(order, "filled_avg_price", None),
+                                default=_to_float(
+                                    getattr(order, "limit_price", None),
+                                    default=_to_float(getattr(order, "stop_price", None), default=0.0),
+                                ),
+                            )
+                            type_val = str(
+                                getattr(
+                                    getattr(order, "type", getattr(order, "order_type", "")),
+                                    "value",
+                                    getattr(order, "type", getattr(order, "order_type", "")),
+                                )
+                            ).lower()
+                            broker_sell_fills[sym] = (fill_p, type_val)
+                except Exception:
+                    pass
+
+            for stale_symbol in stale_symbols:
+                stored_rec = stored_by_symbol[stale_symbol]
+                fill_price, order_type_val = broker_sell_fills.get(
+                    stale_symbol, (stored_rec.current_stop_price, "stop_limit")
+                )
+                exit_price = fill_price if fill_price > 0.0 else stored_rec.current_stop_price
+                is_profit = exit_price > stored_rec.entry_price
+                close_action = (
+                    "TAKE_PROFIT_EXIT"
+                    if is_profit and "stop" not in order_type_val
+                    else "TRAILING_STOP_EXIT"
+                )
+                close_reason = (
+                    f"Broker GTC {order_type_val or 'protective'} order filled between cycles at ${exit_price:,.2f}"
+                )
+                self.last_broker_closed_positions.append(
+                    {
+                        "symbol": stale_symbol,
+                        "qty": stored_rec.qty,
+                        "entry_price": stored_rec.entry_price,
+                        "exit_price": exit_price,
+                        "action": close_action,
+                        "reason": close_reason,
+                    }
+                )
                 self.audit_store.delete_position_state(stale_symbol)
 
         return reconciled

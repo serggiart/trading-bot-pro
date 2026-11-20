@@ -36,6 +36,10 @@ def _compute_setup_score(result: UniverseScreeningResult) -> float:
     score = 0.0
     if ind.ema_20 > 0.0 and ind.current_price > ind.ema_20:
         score += 2.0
+        if ind.atr_14 > 0.0:
+            ext_atr = (ind.current_price - ind.ema_20) / ind.atr_14
+            if ext_atr <= 1.2:
+                score += max(0.0, (1.2 - ext_atr) * 0.75)
 
     if ind.avg_volume_20d > 0.0 and ind.latest_volume > 0.0:
         rel_vol = ind.latest_volume / ind.avg_volume_20d

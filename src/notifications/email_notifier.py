@@ -225,7 +225,10 @@ class EmailNotifier:
             pnl_dollars = (exit_p - float(entry_price)) * float(qty)
             pnl_pct = ((exit_p - float(entry_price)) / float(entry_price)) * 100.0
 
-        is_win = (pnl_dollars is not None and pnl_dollars > 0.0) or act == "TAKE_PROFIT_EXIT"
+        is_win = (pnl_dollars is not None and pnl_dollars > 0.0) or act in {
+            "TAKE_PROFIT_EXIT",
+            "PEAK_EXHAUSTION_EXIT",
+        }
         is_emergency = act == "EMERGENCY_EXIT"
 
         if is_win:
@@ -359,6 +362,65 @@ class EmailNotifier:
         )
         return self.send_email(
             subject=f"🔴 [Circuit Breaker] Pausa protectora diaria activada ({drawdown_pct:.2%})",
+            plain_body=plain,
+            html_body=html_body,
+        )
+
+    def notify_daily_summary(
+        self,
+        equity: float,
+        daily_pnl: float,
+        cash: float | None = None,
+        open_positions: Sequence[Any] = (),
+    ) -> bool:
+        """Send an executive end-of-day account summary card."""
+        base_eq = equity - daily_pnl
+        daily_pct = (daily_pnl / base_eq * 100.0) if base_eq > 0.0 else 0.0
+        is_positive = daily_pnl >= 0.0
+        badge_bg = "#16a34a" if is_positive else "#2563eb"
+        badge_text = (
+            "🟢 RESUMEN DIARIO · BALANCE POSITIVO"
+            if is_positive
+            else "🛡️ RESUMEN DIARIO · CIERRE DE JORNADA"
+        )
+        headline = f"Balance del Día: ${daily_pnl:+,.2f} USD ({daily_pct:+.2f}%)"
+        subtitle = (
+            "Resumen ejecutivo de tu cuenta al cierre de la sesión de Nueva York."
+        )
+        pos_labels: list[str] = []
+        for pos in open_positions:
+            sym = str(getattr(pos, "symbol", "") or "").strip().upper()
+            shares = getattr(pos, "shares", getattr(pos, "qty", 0))
+            if sym:
+                pos_labels.append(f"{sym} ({shares})")
+        positions_str = ", ".join(pos_labels) if pos_labels else "0 (100% en efectivo)"
+
+        rows: list[tuple[str, str]] = [
+            ("Valor Total de la Cuenta (Equity)", f"${equity:,.2f} USD"),
+            ("Resultado del Día (PnL)", f"${daily_pnl:+,.2f} USD ({daily_pct:+.2f}%)"),
+        ]
+        if cash is not None:
+            rows.append(("Efectivo Disponible (Cash)", f"${cash:,.2f} USD"))
+        rows.append(("Posiciones Abiertas ({})".format(len(pos_labels)), positions_str))
+
+        footer = (
+            "Todas las posiciones abiertas quedan resguardadas durante la noche con órdenes Stop-Limit GTC activas en el bróker."
+        )
+        html_body = _build_html_card(
+            badge_bg=badge_bg,
+            badge_text=badge_text,
+            headline=headline,
+            subtitle=subtitle,
+            rows=rows,
+            footer_note=footer,
+        )
+        plain = (
+            f"{badge_text}\n{headline}\n"
+            f"Equity: ${equity:,.2f} | Cash: ${cash or 0.0:,.2f} | Posiciones: {positions_str}"
+        )
+        icon = "🟢" if is_positive else "🛡️"
+        return self.send_email(
+            subject=f"{icon} [Resumen Diario] Equity ${equity:,.2f} ({daily_pnl:+,.2f} USD)",
             plain_body=plain,
             html_body=html_body,
         )
@@ -504,3 +566,22 @@ class CompositeNotifier:
             else False
         )
         return sent_email or sent_tg
+
+    def notify_daily_summary(
+        self,
+        equity: float,
+        daily_pnl: float,
+        cash: float | None = None,
+        open_positions: Sequence[Any] = (),
+    ) -> bool:
+        sent_email = (
+            self.email.notify_daily_summary(
+                equity=equity,
+                daily_pnl=daily_pnl,
+                cash=cash,
+                open_positions=open_positions,
+            )
+            if self.email.is_configured
+            else False
+        )
+        return sent_email

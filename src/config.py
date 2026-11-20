@@ -30,6 +30,12 @@ class StrategySettings:
     rsi_entry_max: float = 60.0
     min_relative_volume: float = 1.2
     max_spread_pct: float = 0.015
+    max_stop_loss_pct: float = 0.0
+    max_ema_extension_atr: float = 0.0
+    breakeven_trigger_pct: float = 0.0
+    peak_activation_pct: float = 0.0
+    peak_pullback_pct: float = 0.0
+    peak_rsi_threshold: float = 66.0
     confirmation_delay_minutes: float = 2.0
     max_confirmation_delay_minutes: float = 5.0
     default_sector: str = "Technology"
@@ -54,6 +60,18 @@ class StrategySettings:
             raise ValueError("min_relative_volume must be non-negative")
         if not 0.0 < self.max_spread_pct <= 1.0:
             raise ValueError("max_spread_pct must be in (0, 1]")
+        if not 0.0 <= self.max_stop_loss_pct < 1.0:
+            raise ValueError("max_stop_loss_pct must be in [0, 1)")
+        if self.max_ema_extension_atr < 0.0:
+            raise ValueError("max_ema_extension_atr must be non-negative")
+        if not 0.0 <= self.breakeven_trigger_pct < 1.0:
+            raise ValueError("breakeven_trigger_pct must be in [0, 1)")
+        if not 0.0 <= self.peak_activation_pct < 1.0:
+            raise ValueError("peak_activation_pct must be in [0, 1)")
+        if not 0.0 <= self.peak_pullback_pct < 1.0:
+            raise ValueError("peak_pullback_pct must be in [0, 1)")
+        if not 0.0 < self.peak_rsi_threshold <= 100.0:
+            raise ValueError("peak_rsi_threshold must be in (0, 100]")
         if self.confirmation_delay_minutes < 0.0:
             raise ValueError("confirmation_delay_minutes must be non-negative")
         if self.max_confirmation_delay_minutes < self.confirmation_delay_minutes:
@@ -129,6 +147,24 @@ def load_strategy_settings(
             raw_data.get("min_relative_volume", defaults.min_relative_volume)
         ),
         max_spread_pct=float(raw_data.get("max_spread_pct", defaults.max_spread_pct)),
+        max_stop_loss_pct=float(
+            raw_data.get("max_stop_loss_pct", defaults.max_stop_loss_pct)
+        ),
+        max_ema_extension_atr=float(
+            raw_data.get("max_ema_extension_atr", defaults.max_ema_extension_atr)
+        ),
+        breakeven_trigger_pct=float(
+            raw_data.get("breakeven_trigger_pct", defaults.breakeven_trigger_pct)
+        ),
+        peak_activation_pct=float(
+            raw_data.get("peak_activation_pct", defaults.peak_activation_pct)
+        ),
+        peak_pullback_pct=float(
+            raw_data.get("peak_pullback_pct", defaults.peak_pullback_pct)
+        ),
+        peak_rsi_threshold=float(
+            raw_data.get("peak_rsi_threshold", defaults.peak_rsi_threshold)
+        ),
         confirmation_delay_minutes=float(
             raw_data.get("confirmation_delay_minutes", defaults.confirmation_delay_minutes)
         ),

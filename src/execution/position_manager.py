@@ -300,6 +300,57 @@ class PositionManager:
                     order_result=order_result,
                 )
 
+        # 2c. Peak Exhaustion / Pullback-from-Peak Exit (locks gains at local peak rollover)
+        peak_gain_pct = (
+            (peak - position.entry_price) / position.entry_price
+            if position.entry_price > 0
+            else 0.0
+        )
+        pullback_from_peak_pct = (
+            (peak - current_price) / peak if peak > 0 else 0.0
+        )
+        if (
+            self.config.peak_activation_pct > 0.0
+            and self.config.peak_pullback_pct > 0.0
+            and peak_gain_pct >= self.config.peak_activation_pct
+            and pullback_from_peak_pct >= self.config.peak_pullback_pct
+            and current_price > position.entry_price
+        ):
+            realized_gain_pct = (current_price - position.entry_price) / position.entry_price
+            reason = (
+                f"Peak exhaustion detected: peak {peak:.2f} (+{peak_gain_pct:.2%}) "
+                f"pulled back {pullback_from_peak_pct:.2%} to {current_price:.2f} "
+                f"(+{realized_gain_pct:.2%} locked)"
+            )
+            peak_metadata: dict[str, Any] = {
+                "exit_type": "PEAK_EXHAUSTION_EXIT",
+                "entry_price": position.entry_price,
+                "highest_price": peak,
+                "current_price": current_price,
+                "peak_gain_pct": round(peak_gain_pct, 6),
+                "pullback_from_peak_pct": round(pullback_from_peak_pct, 6),
+                "return_pct": round(realized_gain_pct, 6),
+                "dry_run": dry_run,
+            }
+            order_result = self.execution_client.submit_limit_sell(
+                symbol=position.symbol,
+                qty=position.qty,
+                reference_price=reference_price,
+                slippage_pct=self.config.exit_slippage_pct,
+                dry_run=dry_run,
+                reason=reason,
+                metadata=peak_metadata,
+            )
+            self._mirror_order_to_local_store(order_result, peak_metadata, eval_now)
+            return ExitEvaluationResult(
+                symbol=position.symbol,
+                action="PEAK_EXHAUSTION_EXIT",
+                should_exit=True,
+                new_stop_price=position.current_stop_price,
+                exit_reason=reason,
+                order_result=order_result,
+            )
+
         # 3. Time-Window Exit (Opportunity Cost Guard)
         if is_time_window_expired(
             entry_price=position.entry_price,
@@ -356,6 +407,12 @@ class PositionManager:
             atr_multiplier=self.config.trailing_atr_multiplier,
             highest_price=position.highest_price,
         )
+        if (
+            self.config.breakeven_trigger_pct > 0.0
+            and peak_gain_pct >= self.config.breakeven_trigger_pct
+        ):
+            breakeven_floor = round(position.entry_price * 1.002, 2)
+            new_stop = max(new_stop, breakeven_floor)
         position.highest_price = peak
 
         if new_stop > position.current_stop_price:

@@ -336,3 +336,194 @@ def test_position_manager_software_take_profit_exit(tmp_path: Path) -> None:
     assert res.should_exit is True
     mock_exec.submit_limit_sell.assert_called_once()
     store.close()
+
+
+def test_position_manager_peak_exhaustion_and_breakeven_lock(tmp_path: Path) -> None:
+    now_ny = datetime(2026, 11, 20, 14, 30, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "peak_exit.db")
+    mock_exec = MagicMock()
+    mock_exec.audit_store = store
+    mock_exec.config = ExecutionConfig(
+        trailing_atr_multiplier=2.5,
+        take_profit_atr_multiplier=5.0,
+        enable_take_profit_exit=False,
+        breakeven_trigger_pct=0.05,
+        peak_activation_pct=0.05,
+        peak_pullback_pct=0.012,
+    )
+    mock_exec.submit_limit_sell.return_value = SimpleNamespace(
+        submitted=True,
+        client_order_id="peak-v-1",
+        broker_order_id="brk-peak-v-1",
+        symbol="V",
+        side="SELL",
+        qty=50.0,
+        limit_price=324.50,
+        stop_price=None,
+        order_type="limit",
+        status="accepted",
+        reason="Peak exhaustion detected",
+    )
+
+    pm = PositionManager(
+        execution_client=mock_exec,
+        audit_store=store,
+        config=mock_exec.config,
+    )
+    pos = ManagedPosition(
+        symbol="V",
+        qty=50.0,
+        entry_price=310.00,
+        current_stop_price=292.00,
+        atr_14=15.00,
+        opened_at=now_ny - timedelta(hours=48),
+        highest_price=310.00,
+        stop_order_id="gtc-stop-v",
+    )
+
+    # 1) Surge to +5.5% ($327.05) with wide ATR ($15 * 2.5 = $37.50) -> breakeven lock raises stop to $310.62
+    res_ratchet = pm.evaluate_and_manage(
+        pos,
+        current_price=327.05,
+        bid_price=327.00,
+        now=now_ny,
+        dry_run=False,
+    )
+    assert res_ratchet.action == "TRAIL_UPDATE"
+    assert res_ratchet.new_stop_price == round(310.00 * 1.002, 2)
+    assert pos.highest_price == 327.05
+
+    # 2) Pull back 1.4% from peak ($327.05 -> $322.40) while still +4.0% above entry -> PEAK_EXHAUSTION_EXIT
+    res_peak = pm.evaluate_and_manage(
+        pos,
+        current_price=322.40,
+        bid_price=322.30,
+        now=now_ny + timedelta(minutes=5),
+        dry_run=False,
+    )
+    assert res_peak.action == "PEAK_EXHAUSTION_EXIT"
+    assert res_peak.should_exit is True
+    mock_exec.submit_limit_sell.assert_called_once()
+    store.close()
+
+
+def test_broker_closed_position_reconciliation_and_daily_summary_email(
+    tmp_path: Path,
+) -> None:
+    now_ny = datetime(2026, 11, 20, 15, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "broker_close.db")
+    store.upsert_position_state(
+        symbol="JNJ",
+        qty=73.0,
+        entry_price=266.74,
+        current_stop_price=266.96,
+        atr_14=3.34,
+        opened_at=now_ny - timedelta(hours=20),
+        highest_price=275.31,
+        stop_order_id="stop-jnj-1",
+    )
+
+    mock_trading_client = MagicMock()
+    mock_trading_client.get_all_positions.return_value = []  # Closed at broker
+    mock_trading_client.get_orders.side_effect = [
+        [],  # status=OPEN
+        [
+            SimpleNamespace(
+                symbol="JNJ",
+                side="sell",
+                status="filled",
+                type="stop_limit",
+                filled_avg_price="267.10",
+            )
+        ],  # status=ALL
+    ]
+
+    exec_client = AlpacaExecutionClient(
+        audit_store=store,
+        trading_client=mock_trading_client,
+    )
+    reconciled = exec_client.reconcile_managed_positions(now=now_ny)
+    assert reconciled == []
+    assert len(exec_client.last_broker_closed_positions) == 1
+    closed_info = exec_client.last_broker_closed_positions[0]
+    assert closed_info["symbol"] == "JNJ"
+    assert closed_info["exit_price"] == 267.10
+    assert store.get_open_position_states() == []
+
+    # Verify daily summary HTML email generation
+    from src.notifications import EmailNotifier
+
+    sent_messages: list[tuple[str, str, str]] = []
+
+    class _FakeSMTP:
+        def __init__(self, host: str, port: int, timeout: float = 15.0) -> None:
+            pass
+
+        def __enter__(self) -> _FakeSMTP:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def starttls(self) -> None:
+            pass
+
+        def login(self, user: str, pwd: str) -> None:
+            pass
+
+        def sendmail(self, sender: str, recipients: list[str], msg_str: str) -> None:
+            sent_messages.append((sender, recipients[0], msg_str))
+
+    email_notifier = EmailNotifier(
+        smtp_user="sergio5453@gmail.com",
+        smtp_app_password="app-password",
+        recipient_email="serggi.art@gmail.com",
+        smtp_factory=_FakeSMTP,  # type: ignore[arg-type]
+    )
+    assert email_notifier.notify_daily_summary(
+        equity=100_987.91,
+        daily_pnl=985.59,
+        cash=30_000.00,
+        open_positions=[SimpleNamespace(symbol="JNJ", shares=73)],
+    ) is True
+    assert len(sent_messages) == 1
+    store.close()
+
+
+def test_cli_close_symbols_submits_limit_sell_and_clears_state(tmp_path: Path) -> None:
+    from main import main
+
+    now_ny = datetime(2026, 11, 20, 15, 30, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "cli_close.db")
+    store.upsert_position_state(
+        symbol="AAPL",
+        qty=55.0,
+        entry_price=296.45,
+        current_stop_price=286.63,
+        atr_14=5.61,
+        opened_at=now_ny - timedelta(hours=5),
+    )
+
+    mock_bot = MagicMock()
+    mock_bot.audit_store = store
+    mock_bot.execution_client.get_open_positions.return_value = [
+        SimpleNamespace(
+            symbol="AAPL",
+            shares=55.0,
+            market_value=16390.0,
+            avg_price=296.45,
+        )
+    ]
+    mock_bot.screener.market_data.get_quote.return_value = SimpleNamespace(
+        price=298.10,
+        bid_price=298.00,
+    )
+    mock_bot.execution_client.submit_limit_sell.return_value = SimpleNamespace(
+        limit_price=297.11,
+    )
+
+    rc = main(["--close-symbols", "AAPL"], orchestrator=mock_bot)
+    assert rc == 0
+    mock_bot.execution_client.submit_limit_sell.assert_called_once()
+    assert store.get_open_position_states() == []
+    store.close()

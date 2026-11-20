@@ -401,6 +401,28 @@ class BacktestEngine:
                         0.0, pos.take_profit_price * (1.0 - self.config.slippage_pct)
                     )
                     exit_reason = "TAKE_PROFIT"
+                elif (
+                    self.config.peak_activation_pct > 0.0
+                    and ((bar_close - pos.entry_price) / pos.entry_price)
+                    >= self.config.peak_activation_pct
+                    and (
+                        float(p.rsi_series.iloc[pos_idx - 1])
+                        if pos_idx > 0
+                        else float(p.rsi_series.iloc[pos_idx])
+                    )
+                    >= self.config.peak_rsi_threshold
+                    and (
+                        float(p.rsi_series.iloc[pos_idx])
+                        < (
+                            float(p.rsi_series.iloc[pos_idx - 1])
+                            if pos_idx > 0
+                            else float(p.rsi_series.iloc[pos_idx])
+                        )
+                        or bar_close < float(p.opens[pos_idx])
+                    )
+                ):
+                    exit_price = max(0.0, bar_close * (1.0 - self.config.slippage_pct))
+                    exit_reason = "PEAK_EXHAUSTION"
                 elif pos.bars_held >= self.config.max_hold_bars:
                     exit_price = max(0.0, bar_close * (1.0 - self.config.slippage_pct))
                     exit_reason = "TIME_EXIT"
@@ -420,6 +442,12 @@ class BacktestEngine:
                         highest_price=pos.highest_price,
                     )
                     pos.highest_price = max(pos.highest_price, bar_close)
+                    if (
+                        self.config.breakeven_trigger_pct > 0.0
+                        and ((pos.highest_price - pos.entry_price) / pos.entry_price)
+                        >= self.config.breakeven_trigger_pct
+                    ):
+                        new_stop = max(new_stop, round(pos.entry_price * 1.002, 2))
                     pos.stop_price = new_stop
 
                 if exit_price is not None and exit_reason is not None:
@@ -497,6 +525,13 @@ class BacktestEngine:
                 if bar_atr <= 0.0:
                     continue
 
+                ext_atr = (bar_close - ema_val) / bar_atr
+                if (
+                    self.config.max_ema_extension_atr > 0.0
+                    and ext_atr > self.config.max_ema_extension_atr
+                ):
+                    continue
+
                 setup_score = (
                     (self.config.rsi_entry_max - rsi_val) * 0.5
                     + min(rel_vol, 3.0) * 10.0
@@ -549,6 +584,10 @@ class BacktestEngine:
                 initial_stop = max(
                     0.0, entry_price - bar_atr * self.config.atr_stop_multiplier
                 )
+                if self.config.max_stop_loss_pct > 0.0:
+                    initial_stop = max(
+                        initial_stop, entry_price * (1.0 - self.config.max_stop_loss_pct)
+                    )
                 take_profit = (
                     entry_price + bar_atr * self.config.atr_take_profit_multiplier
                 )

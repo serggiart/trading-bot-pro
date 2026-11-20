@@ -260,6 +260,8 @@ class TradingBotOrchestrator:
         default_fed_dates: Sequence[datetime] = (),
         candle_store: Any | None = None,
         skip_ai_on_prefilter_fail: bool = False,
+        max_stop_loss_pct: float = 0.0,
+        max_ema_extension_atr: float = 0.0,
     ) -> None:
         self.audit_store = audit_store or TradingAuditStore()
         self.guardian = guardian or RiskGuardian()
@@ -282,6 +284,8 @@ class TradingBotOrchestrator:
         self.max_candidates_for_ai = int(max_candidates_for_ai)
         self.default_fed_dates: tuple[datetime, ...] = tuple(default_fed_dates)
         self.skip_ai_on_prefilter_fail = bool(skip_ai_on_prefilter_fail)
+        self.max_stop_loss_pct = float(max_stop_loss_pct)
+        self.max_ema_extension_atr = float(max_ema_extension_atr)
 
     @property
     def screener(self) -> UniverseScreener:
@@ -558,6 +562,17 @@ class TradingBotOrchestrator:
         # already fails hard anti-disinformation thresholds.
         if self.skip_ai_on_prefilter_fail and isinstance(analyst_config, AnalystConfig):
             prefilter_reasons: list[str] = []
+            if (
+                self.max_ema_extension_atr > 0.0
+                and indicators.ema_20 > 0.0
+                and indicators.atr_14 > 0.0
+            ):
+                ext_atr = (ask_price - indicators.ema_20) / indicators.atr_14
+                if ext_atr > self.max_ema_extension_atr:
+                    prefilter_reasons.append(
+                        f"ema_extension_atr {ext_atr:.2f} > {self.max_ema_extension_atr:.2f} "
+                        "(stretched near local peak; waiting for trough pullback)"
+                    )
             rel_vol = compute_relative_volume(cur_vol, avg_vol)
             if rel_vol < analyst_config.min_relative_volume:
                 prefilter_reasons.append(
@@ -672,6 +687,9 @@ class TradingBotOrchestrator:
             if decision.position_size is not None
             else max(0.01, ask_price - self.guardian.config.atr_multiplier * indicators.atr_14)
         )
+        if self.max_stop_loss_pct > 0.0:
+            max_stop_floor = round(ask_price * (1.0 - self.max_stop_loss_pct), 2)
+            stop_loss_price = max(stop_loss_price, max_stop_floor)
         take_profit_price: float | None = None
         if self.take_profit_atr_multiplier > 0.0 and indicators.atr_14 > 0.0:
             take_profit_price = round(
@@ -883,6 +901,33 @@ class TradingBotOrchestrator:
                         reconciled = reconcile_fn(now=now_ny)
                     if isinstance(reconciled, Sequence):
                         open_positions = reconciled
+                    for closed_pos in getattr(
+                        self.execution_client, "last_broker_closed_positions", ()
+                    ):
+                        close_fn = getattr(self.notifier, "notify_position_closed", None)
+                        if callable(close_fn):
+                            try:
+                                close_fn(
+                                    symbol=closed_pos["symbol"],
+                                    action=closed_pos.get("action", "TRAILING_STOP_EXIT"),
+                                    qty=closed_pos["qty"],
+                                    limit_price=closed_pos["exit_price"],
+                                    reason=closed_pos.get(
+                                        "reason", "Broker GTC order filled"
+                                    ),
+                                    entry_price=closed_pos.get("entry_price"),
+                                    dry_run=dry_run,
+                                )
+                            except TypeError:
+                                close_fn(
+                                    symbol=closed_pos["symbol"],
+                                    action=closed_pos.get("action", "TRAILING_STOP_EXIT"),
+                                    qty=closed_pos["qty"],
+                                    limit_price=closed_pos["exit_price"],
+                                    reason=closed_pos.get(
+                                        "reason", "Broker GTC order filled"
+                                    ),
+                                )
 
         exit_results = (
             self._manage_open_positions(
@@ -1328,6 +1373,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Send a sample HTML 'Good News' trade notification email via Gmail SMTP and exit",
     )
+    parser.add_argument(
+        "--send-daily-summary",
+        action="store_true",
+        help="Sync live/paper account state, send the daily summary HTML email, and exit",
+    )
+    parser.add_argument(
+        "--close-symbols",
+        nargs="+",
+        default=None,
+        help="Close specific open broker positions via protective Limit SELL orders and exit",
+    )
 
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.interval_seconds <= 0:
@@ -1362,14 +1418,25 @@ def _run_backtest_cli(
     except Exception as exc:
         logger.warning("Could not load ^VIX history for backtest (%s); using default VIX", exc)
 
-    config = BacktestConfig(
-        initial_capital=args.initial_capital,
-        atr_stop_multiplier=settings.atr_stop_multiplier,
-        atr_take_profit_multiplier=settings.atr_take_profit_multiplier,
-        max_hold_bars=settings.max_hold_bars,
-        rsi_entry_max=settings.rsi_entry_max,
-        min_relative_volume=settings.min_relative_volume,
-    )
+    bt_kwargs: dict[str, Any] = {
+        "initial_capital": args.initial_capital,
+        "atr_stop_multiplier": settings.atr_stop_multiplier,
+        "atr_take_profit_multiplier": settings.atr_take_profit_multiplier,
+        "max_hold_bars": settings.max_hold_bars,
+        "rsi_entry_max": settings.rsi_entry_max,
+        "min_relative_volume": settings.min_relative_volume,
+    }
+    if settings.max_stop_loss_pct > 0.0:
+        bt_kwargs["max_stop_loss_pct"] = settings.max_stop_loss_pct
+    if settings.max_ema_extension_atr > 0.0:
+        bt_kwargs["max_ema_extension_atr"] = settings.max_ema_extension_atr
+    if settings.breakeven_trigger_pct > 0.0:
+        bt_kwargs["breakeven_trigger_pct"] = settings.breakeven_trigger_pct
+    if settings.peak_activation_pct > 0.0:
+        bt_kwargs["peak_activation_pct"] = settings.peak_activation_pct
+    if settings.peak_rsi_threshold != 66.0:
+        bt_kwargs["peak_rsi_threshold"] = settings.peak_rsi_threshold
+    config = BacktestConfig(**bt_kwargs)
     engine = BacktestEngine(guardian=guardian or RiskGuardian(), config=config)
     corr_matrix = compute_return_correlation_matrix(market_data)
     report = engine.run(
@@ -1413,6 +1480,10 @@ def _build_orchestrator_from_settings(
         trailing_atr_multiplier=settings.trailing_atr_multiplier,
         take_profit_atr_multiplier=settings.atr_take_profit_multiplier,
         enable_take_profit_exit=settings.atr_take_profit_multiplier > 0.0,
+        max_stop_loss_pct=settings.max_stop_loss_pct,
+        breakeven_trigger_pct=settings.breakeven_trigger_pct,
+        peak_activation_pct=settings.peak_activation_pct,
+        peak_pullback_pct=settings.peak_pullback_pct,
         max_hold_hours=settings.max_hold_hours,
         min_target_return_pct=settings.min_target_return_pct,
     )
@@ -1446,6 +1517,8 @@ def _build_orchestrator_from_settings(
         max_candidates_for_ai=max_candidates,
         default_fed_dates=load_fed_dates(),
         skip_ai_on_prefilter_fail=True,
+        max_stop_loss_pct=settings.max_stop_loss_pct,
+        max_ema_extension_atr=settings.max_ema_extension_atr,
     )
 
 
@@ -1593,6 +1666,80 @@ def main(
             settings=settings,
             guardian=orchestrator.guardian if orchestrator is not None else None,
         )
+
+    if args.send_daily_summary:
+        bot = orchestrator or _build_orchestrator_from_settings(
+            db_path=args.db_path,
+            settings=settings,
+            max_candidates=resolved_max_candidates,
+        )
+        eq, pnl, positions, cash = bot._sync_broker_account_state(
+            starting_equity=100_000.0,
+            daily_pnl=0.0,
+            portfolio_positions=(),
+        )
+        summary_fn = getattr(bot.notifier, "notify_daily_summary", None)
+        if callable(summary_fn):
+            ok = summary_fn(
+                equity=eq + pnl,
+                daily_pnl=pnl,
+                cash=cash,
+                open_positions=positions,
+            )
+            return 0 if ok else 1
+        return 1
+
+    if args.close_symbols:
+        bot = orchestrator or _build_orchestrator_from_settings(
+            db_path=args.db_path,
+            settings=settings,
+            max_candidates=resolved_max_candidates,
+        )
+        targets = {s.strip().upper() for s in args.close_symbols if s.strip()}
+        open_positions = bot.execution_client.get_open_positions() or []
+        pos_by_sym = {p.symbol.strip().upper(): p for p in open_positions}
+        for sym in sorted(targets):
+            pos = pos_by_sym.get(sym)
+            if pos is None or pos.shares <= 0:
+                logger.warning("No active broker position found for %s; skipping", sym)
+                continue
+            ref_price = pos.market_value / pos.shares if pos.market_value > 0 else pos.avg_price
+            try:
+                q = bot.screener.market_data.get_quote(sym)
+                if q.bid_price > 0:
+                    ref_price = q.bid_price
+                elif q.price > 0:
+                    ref_price = q.price
+            except Exception:
+                pass
+            order_res = bot.execution_client.submit_limit_sell(
+                symbol=sym,
+                qty=pos.shares,
+                reference_price=ref_price,
+                dry_run=args.dry_run,
+                reason="Manual CLI position close (--close-symbols)",
+            )
+            if not args.dry_run:
+                bot.audit_store.delete_position_state(sym)
+            close_fn = getattr(bot.notifier, "notify_position_closed", None)
+            if callable(close_fn):
+                close_fn(
+                    symbol=sym,
+                    action="MANUAL_LIMIT_CLOSE",
+                    qty=pos.shares,
+                    limit_price=order_res.limit_price,
+                    reason="Cierre manual programado (--close-symbols) mediante orden Limit",
+                    entry_price=pos.avg_price,
+                    dry_run=args.dry_run,
+                )
+            logger.info(
+                "Submitted limit close for %s: qty=%s limit_price=%.2f (dry_run=%s)",
+                sym,
+                pos.shares,
+                order_res.limit_price,
+                args.dry_run,
+            )
+        return 0
 
     if orchestrator is not None:
         return _run_loop(orchestrator, resolved_tickers, args, sleep_fn)

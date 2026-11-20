@@ -29,6 +29,10 @@ class ExecutionConfig:
     trailing_atr_multiplier: float = 2.0
     take_profit_atr_multiplier: float = 2.0
     enable_take_profit_exit: bool = False
+    max_stop_loss_pct: float = 0.0
+    breakeven_trigger_pct: float = 0.0
+    peak_activation_pct: float = 0.0
+    peak_pullback_pct: float = 0.0
     max_hold_hours: float = 72.0
     min_target_return_pct: float = 0.01
     flash_crash_window_minutes: float = 5.0
@@ -52,6 +56,14 @@ class ExecutionConfig:
             raise ValueError("flash_crash_window_minutes must be positive")
         if not 0 < self.flash_crash_drop_pct < 1.0:
             raise ValueError("flash_crash_drop_pct must be in (0, 1.0)")
+        if not 0.0 <= self.max_stop_loss_pct < 1.0:
+            raise ValueError("max_stop_loss_pct must be in [0, 1.0)")
+        if not 0.0 <= self.breakeven_trigger_pct < 1.0:
+            raise ValueError("breakeven_trigger_pct must be in [0, 1.0)")
+        if not 0.0 <= self.peak_activation_pct < 1.0:
+            raise ValueError("peak_activation_pct must be in [0, 1.0)")
+        if not 0.0 <= self.peak_pullback_pct < 1.0:
+            raise ValueError("peak_pullback_pct must be in [0, 1.0)")
 
 
 @dataclass(slots=True)
@@ -114,6 +126,7 @@ ExitAction = Literal[
     "TRAIL_UPDATE",
     "TIME_EXIT",
     "TAKE_PROFIT_EXIT",
+    "PEAK_EXHAUSTION_EXIT",
     "TRAILING_STOP_EXIT",
     "EMERGENCY_EXIT",
 ]
