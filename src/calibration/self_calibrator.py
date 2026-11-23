@@ -73,12 +73,57 @@ class StrategySelfCalibrator:
         self.min_active_tickers = int(min_active_tickers)
         self.max_allowed_drawdown_pct = float(max_allowed_drawdown_pct)
 
+    def _compute_live_pf_multiplier(
+        self,
+        symbol: str,
+        audit_store: Any | None,
+    ) -> tuple[float, int, float]:
+        """Inspect live SQLite BUY/SELL order history to reward live winners and penalize live losers."""
+        if audit_store is None or not hasattr(audit_store, "get_orders"):
+            return 1.0, 0, 0.0
+        try:
+            records = list(reversed(audit_store.get_orders(symbol=symbol, limit=40)))
+        except Exception:
+            return 1.0, 0, 0.0
+
+        last_buy_price: float | None = None
+        realized_pnls: list[float] = []
+        for rec in records:
+            status = str(getattr(rec, "status", "")).lower()
+            if status in {"dry_run", "rejected", "canceled", "cancelled"}:
+                continue
+            side = str(getattr(rec, "side", "")).upper()
+            price = float(getattr(rec, "limit_price", 0.0) or 0.0)
+            qty = float(getattr(rec, "qty", 0.0) or 0.0)
+            if price <= 0.0 or qty <= 0.0:
+                continue
+            if side == "BUY" and status == "filled":
+                last_buy_price = price
+            elif side == "SELL" and last_buy_price is not None:
+                # Only count actual exits (where sell limit is near or above entry, or filled stop)
+                if status in {"filled", "pending_new"}:
+                    realized_pnls.append((price - last_buy_price) * qty)
+                    last_buy_price = None
+
+        if not realized_pnls:
+            return 1.0, 0, 0.0
+        net_live_pnl = sum(realized_pnls)
+        live_losses = sum(1 for p in realized_pnls if p < 0.0)
+        if net_live_pnl < 0.0 and live_losses >= 2:
+            return 0.70, len(realized_pnls), net_live_pnl
+        if net_live_pnl < 0.0:
+            return 0.85, len(realized_pnls), net_live_pnl
+        if net_live_pnl > 0.0:
+            return 1.10, len(realized_pnls), net_live_pnl
+        return 1.0, len(realized_pnls), net_live_pnl
+
     def evaluate_tickers(
         self,
         market_data: Mapping[str, pd.DataFrame],
         vix_series: pd.Series | None,
         settings: StrategySettings,
         candidate_tickers: Sequence[str] | None = None,
+        audit_store: Any | None = None,
     ) -> tuple[list[str], list[str], list[TickerCalibrationScore]]:
         """Evaluate each ticker's standalone wave expectancy and prune chronic chop tickers."""
         symbols = [
@@ -110,21 +155,31 @@ class StrategySelfCalibrator:
                 .run({sym: df}, vix_series=vix_series, sector_map=settings.sector_map)
                 .metrics
             )
+            live_mult, live_trades, live_pnl = self._compute_live_pf_multiplier(
+                sym, audit_store
+            )
+            effective_pf = m.profit_factor * live_mult
+            total_combined_trades = m.total_trades + live_trades
             should_prune = (
-                m.total_trades >= self.min_trades_for_pruning
-                and m.profit_factor < self.min_ticker_profit_factor
+                total_combined_trades >= self.min_trades_for_pruning
+                and effective_pf < self.min_ticker_profit_factor
+            )
+            live_tag = (
+                f", live={live_trades} trades ({live_pnl:+.2f} USD)"
+                if live_trades > 0
+                else ""
             )
             reason = (
-                f"Pruned: PF {m.profit_factor:.2f} < {self.min_ticker_profit_factor:.2f} across {m.total_trades} trades"
+                f"Pruned: effective PF {effective_pf:.2f} < {self.min_ticker_profit_factor:.2f} across {total_combined_trades} trades{live_tag}"
                 if should_prune
-                else f"Active: PF {m.profit_factor:.2f} ({m.total_trades} trades, {m.total_return_pct:+.2%})"
+                else f"Active: effective PF {effective_pf:.2f} ({m.total_trades} bt trades, {m.total_return_pct:+.2%}{live_tag})"
             )
             scores.append(
                 TickerCalibrationScore(
                     symbol=sym,
-                    total_trades=m.total_trades,
+                    total_trades=total_combined_trades,
                     win_rate=m.win_rate,
-                    profit_factor=m.profit_factor,
+                    profit_factor=effective_pf,
                     total_return_pct=m.total_return_pct,
                     keep=not should_prune,
                     reason=reason,
@@ -155,6 +210,7 @@ class StrategySelfCalibrator:
         settings: StrategySettings,
         master_tickers: Sequence[str] | None = None,
         parameter_grid: Sequence[dict[str, float]] | None = None,
+        audit_store: Any | None = None,
     ) -> CalibrationReport:
         """Run walk-forward universe pruning + bounded wave parameter optimization."""
         current_symbols = [
@@ -196,6 +252,7 @@ class StrategySelfCalibrator:
             vix_series=vix_series,
             settings=settings,
             candidate_tickers=pool_tickers,
+            audit_store=audit_store,
         )
         active_md = {sym: market_data[sym] for sym in active_tickers if sym in market_data}
         active_corr = compute_return_correlation_matrix(active_md)

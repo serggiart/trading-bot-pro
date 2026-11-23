@@ -1713,6 +1713,11 @@ def _run_loop(
                             )
                     except Exception as exc:
                         logger.warning("Could not send end-of-day summary email: %s", exc)
+                    if type(bot) is TradingBotOrchestrator:
+                        try:
+                            _run_eod_auto_calibration(bot, args)
+                        except Exception as exc:
+                            logger.warning("End-of-day self-calibration skipped: %s", exc)
                     logger.info(
                         "Market closed for the day after active session; daily summary sent. Exiting loop cleanly."
                     )
@@ -1749,6 +1754,65 @@ def _run_loop(
         signal.signal(signal.SIGINT, prev_sigint)
 
     return 0
+
+
+def _run_eod_auto_calibration(
+    bot: TradingBotOrchestrator,
+    args: argparse.Namespace,
+) -> None:
+    """Automatically recalibrate active universe and wave parameters using today's candles and live SQLite outcomes."""
+    import json as json_module
+    from src.backtest import ParquetCandleStore
+    from src.calibration import StrategySelfCalibrator
+    from src.config import DEFAULT_STRATEGY_CONFIG_PATH
+
+    cfg_path = getattr(args, "config", None) or DEFAULT_STRATEGY_CONFIG_PATH
+    settings = load_strategy_settings(cfg_path)
+    master_tickers: list[str] = list(settings.tickers)
+    if Path(cfg_path).exists():
+        try:
+            raw_cfg = json_module.loads(Path(cfg_path).read_text(encoding="utf-8"))
+            if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get("master_tickers"), list):
+                master_tickers = [
+                    str(t).strip().upper()
+                    for t in raw_cfg["master_tickers"]
+                    if str(t).strip()
+                ]
+        except Exception:
+            pass
+
+    store = ParquetCandleStore()
+    all_syms = sorted(set(master_tickers) | set(settings.tickers))
+    market_data = {
+        sym: store.get_or_fetch_candles(sym, period="3y", force_refresh=True)
+        for sym in all_syms
+    }
+    vix_series = None
+    try:
+        vix_df = store.get_or_fetch_candles("^VIX", period="3y", force_refresh=True)
+        if vix_df is not None and not vix_df.empty and "Close" in vix_df.columns:
+            vix_series = vix_df["Close"]
+    except Exception:
+        pass
+
+    calibrator = StrategySelfCalibrator()
+    report = calibrator.calibrate(
+        market_data=market_data,
+        vix_series=vix_series,
+        settings=settings,
+        master_tickers=master_tickers,
+        audit_store=bot.audit_store,
+    )
+    applied = calibrator.apply_to_config_file(report, config_path=cfg_path)
+    logger.info(
+        "EOD Auto-Calibration complete: improved=%s applied=%s active=%d pruned=%d score=%.4f->%.4f",
+        report.improved,
+        applied,
+        len(report.active_tickers),
+        len(report.pruned_tickers),
+        report.baseline_score,
+        report.calibrated_score,
+    )
 
 
 def main(
@@ -1838,11 +1902,17 @@ def main(
             pass
 
         calibrator = StrategySelfCalibrator()
+        cal_audit_store = (
+            orchestrator.audit_store
+            if orchestrator is not None
+            else TradingAuditStore(db_path=args.db_path)
+        )
         cal_report = calibrator.calibrate(
             market_data=market_data,
             vix_series=vix_series,
             settings=settings,
             master_tickers=master_tickers,
+            audit_store=cal_audit_store,
         )
         applied = False
         if args.apply_calibration and cal_report.improved:
