@@ -1239,6 +1239,21 @@ class TradingBotOrchestrator:
                     )
                     continue
 
+            if remaining_cash is not None and remaining_cash < 100.0:
+                outcomes.append(
+                    TickerPipelineOutcome(
+                        symbol=symbol,
+                        stage_reached="cash_prefilter",
+                        status="skipped_insufficient_cash",
+                        approved=False,
+                        reasons=[
+                            f"Insufficient remaining cash (${remaining_cash:,.2f} < $100.00; skipped LLM call)"
+                        ],
+                        screening_result=pre_screened,
+                    )
+                )
+                continue
+
             try:
                 outcome = self._process_symbol(
                     symbol=symbol,

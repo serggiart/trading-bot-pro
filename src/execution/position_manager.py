@@ -408,6 +408,15 @@ class PositionManager:
             highest_price=position.highest_price,
         )
         if (
+            self.config.max_stop_loss_pct > 0.0
+            and position.entry_price > 0.0
+        ):
+            max_loss_floor = round(
+                position.entry_price * (1.0 - self.config.max_stop_loss_pct), 2
+            )
+            if current_price > round(max_loss_floor * 1.005, 2):
+                new_stop = max(new_stop, max_loss_floor)
+        if (
             self.config.breakeven_trigger_pct > 0.0
             and peak_gain_pct >= self.config.breakeven_trigger_pct
         ):
@@ -418,11 +427,14 @@ class PositionManager:
         if new_stop > position.current_stop_price:
             if position.stop_order_id:
                 try:
-                    self.execution_client.update_stop_order(
+                    replaced_stop = self.execution_client.update_stop_order(
                         stop_order_id=position.stop_order_id,
                         new_stop_price=new_stop,
                         dry_run=dry_run,
                     )
+                    new_broker_id = getattr(replaced_stop, "broker_order_id", None)
+                    if isinstance(new_broker_id, str) and new_broker_id.strip():
+                        position.stop_order_id = new_broker_id.strip()
                 except Exception as exc:
                     err_text = str(exc).lower()
                     logger.warning(

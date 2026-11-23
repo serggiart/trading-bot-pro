@@ -527,3 +527,46 @@ def test_cli_close_symbols_submits_limit_sell_and_clears_state(tmp_path: Path) -
     mock_bot.execution_client.submit_limit_sell.assert_called_once()
     assert store.get_open_position_states() == []
     store.close()
+
+
+def test_position_manager_max_stop_loss_pct_tightens_legacy_wide_stop(
+    tmp_path: Path,
+) -> None:
+    now_ny = datetime(2026, 11, 23, 12, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "max_stop_cap.db")
+    mock_exec = MagicMock()
+    mock_exec.audit_store = store
+    mock_exec.config = ExecutionConfig(
+        trailing_atr_multiplier=2.5,
+        max_stop_loss_pct=0.06,
+    )
+    pm = PositionManager(
+        execution_client=mock_exec,
+        audit_store=store,
+        config=mock_exec.config,
+    )
+    pos = ManagedPosition(
+        symbol="AMD",
+        qty=11.0,
+        entry_price=482.16,
+        current_stop_price=396.21,
+        atr_14=34.38,
+        opened_at=now_ny - timedelta(hours=48),
+        highest_price=482.16,
+        stop_order_id="stop-amd-legacy",
+    )
+    res = pm.evaluate_and_manage(
+        pos,
+        current_price=459.93,
+        bid_price=459.80,
+        now=now_ny,
+        dry_run=False,
+    )
+    assert res.action == "TRAIL_UPDATE"
+    assert res.new_stop_price == round(482.16 * 0.94, 2)  # $453.23 (-6.0%)
+    mock_exec.update_stop_order.assert_called_once_with(
+        stop_order_id="stop-amd-legacy",
+        new_stop_price=453.23,
+        dry_run=False,
+    )
+    store.close()

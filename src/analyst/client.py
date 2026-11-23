@@ -338,6 +338,8 @@ class GeminiAnalyst:
                             status_code,
                             candidate_models[idx + 1],
                         )
+                        if type(client) is genai.Client and status_code in {429, 500, 503, 504}:
+                            time.sleep(0.75 * (idx + 1))
                         last_exc = exc
                         continue
                 raise
