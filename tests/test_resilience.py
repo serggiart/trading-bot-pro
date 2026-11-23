@@ -570,3 +570,36 @@ def test_position_manager_max_stop_loss_pct_tightens_legacy_wide_stop(
         dry_run=False,
     )
     store.close()
+
+
+def test_loop_exits_cleanly_and_sends_daily_summary_when_market_closes() -> None:
+    from main import PipelineCycleReport, main
+
+    open_ts = datetime(2026, 11, 23, 15, 58, tzinfo=NY_TIMEZONE)
+    close_ts = datetime(2026, 11, 23, 16, 3, tzinfo=NY_TIMEZONE)
+
+    mock_bot = MagicMock()
+    mock_bot.run_cycle.side_effect = [
+        PipelineCycleReport(timestamp=open_ts, market_open=True, skipped=False),
+        PipelineCycleReport(
+            timestamp=close_ts,
+            market_open=False,
+            skipped=True,
+            skip_reason="Market closed",
+        ),
+    ]
+    mock_bot._sync_broker_account_state.return_value = (97_945.63, 1_789.73, [], 167.42)
+
+    rc = main(
+        ["--loop", "--interval-seconds", "1", "--sync-account"],
+        orchestrator=mock_bot,
+        sleep_fn=lambda _s: None,
+    )
+    assert rc == 0
+    assert mock_bot.run_cycle.call_count == 2
+    mock_bot.notifier.notify_daily_summary.assert_called_once_with(
+        equity=97_945.63 + 1_789.73,
+        daily_pnl=1_789.73,
+        cash=167.42,
+        open_positions=[],
+    )

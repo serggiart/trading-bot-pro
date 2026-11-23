@@ -13,7 +13,7 @@ import time as time_module
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -286,6 +286,8 @@ class TradingBotOrchestrator:
         self.skip_ai_on_prefilter_fail = bool(skip_ai_on_prefilter_fail)
         self.max_stop_loss_pct = float(max_stop_loss_pct)
         self.max_ema_extension_atr = float(max_ema_extension_atr)
+        self.stop_reentry_cooldown_hours: float = 24.0
+        self._stop_loss_cooldowns: dict[str, datetime] = {}
 
     @property
     def screener(self) -> UniverseScreener:
@@ -390,6 +392,14 @@ class TradingBotOrchestrator:
                         if result.order_result is not None
                         else bid_price
                     )
+                    if (
+                        result.action in {"TRAILING_STOP_EXIT", "EMERGENCY_EXIT"}
+                        and limit_price is not None
+                        and limit_price <= position.entry_price
+                    ):
+                        self._stop_loss_cooldowns[symbol] = now_ny + timedelta(
+                            hours=self.stop_reentry_cooldown_hours
+                        )
                     close_fn = self.notifier.notify_position_closed
                     try:
                         sig = inspect.signature(close_fn)
@@ -562,6 +572,21 @@ class TradingBotOrchestrator:
         # already fails hard anti-disinformation thresholds.
         if self.skip_ai_on_prefilter_fail and isinstance(analyst_config, AnalystConfig):
             prefilter_reasons: list[str] = []
+            if (
+                available_capital is not None
+                and ask_price > 0.0
+                and available_capital < ask_price
+            ):
+                return TickerPipelineOutcome(
+                    symbol=symbol,
+                    stage_reached="cash_prefilter",
+                    status="skipped_insufficient_cash",
+                    approved=False,
+                    reasons=[
+                        f"Insufficient cash (${available_capital:,.2f}) for 1 share of {symbol} at ${ask_price:,.2f} (skipped LLM call)"
+                    ],
+                    screening_result=screening,
+                )
             if (
                 self.max_ema_extension_atr > 0.0
                 and indicators.ema_20 > 0.0
@@ -904,6 +929,17 @@ class TradingBotOrchestrator:
                     for closed_pos in getattr(
                         self.execution_client, "last_broker_closed_positions", ()
                     ):
+                        closed_sym = str(closed_pos.get("symbol", "")).strip().upper()
+                        closed_exit = float(closed_pos.get("exit_price", 0.0) or 0.0)
+                        closed_entry = float(closed_pos.get("entry_price", 0.0) or 0.0)
+                        if (
+                            closed_sym
+                            and closed_entry > 0.0
+                            and closed_exit <= closed_entry
+                        ):
+                            self._stop_loss_cooldowns[closed_sym] = now_ny + timedelta(
+                                hours=self.stop_reentry_cooldown_hours
+                            )
                         close_fn = getattr(self.notifier, "notify_position_closed", None)
                         if callable(close_fn):
                             try:
@@ -1032,6 +1068,22 @@ class TradingBotOrchestrator:
                         reasons=[f"Symbol {symbol} already held in portfolio (skipped LLM call)"],
                     )
                     continue
+                cooldown_until = self._stop_loss_cooldowns.get(symbol)
+                if (
+                    self.skip_ai_on_prefilter_fail
+                    and cooldown_until is not None
+                    and now_ny < cooldown_until
+                ):
+                    prefiltered_skip_outcomes[symbol] = TickerPipelineOutcome(
+                        symbol=symbol,
+                        stage_reached="cooldown_prefilter",
+                        status="skipped_stop_cooldown",
+                        approved=False,
+                        reasons=[
+                            f"Post-stop-loss cooldown active for {symbol} until {cooldown_until.isoformat()} (skipped LLM call)"
+                        ],
+                    )
+                    continue
                 if vix_blocked_reason is not None:
                     prefiltered_skip_outcomes[symbol] = TickerPipelineOutcome(
                         symbol=symbol,
@@ -1140,6 +1192,27 @@ class TradingBotOrchestrator:
                             continue
                     ind = res.indicators
                     quote = res.quote
+                    candidate_ask = (
+                        quote.ask_price
+                        if quote is not None and quote.ask_price > 0.0
+                        else (ind.current_price if ind is not None else 0.0)
+                    )
+                    if (
+                        remaining_cash is not None
+                        and candidate_ask > 0.0
+                        and remaining_cash < candidate_ask
+                    ):
+                        prefiltered_skip_outcomes[res.symbol] = TickerPipelineOutcome(
+                            symbol=res.symbol,
+                            stage_reached="cash_prefilter",
+                            status="skipped_insufficient_cash",
+                            approved=False,
+                            reasons=[
+                                f"Insufficient cash (${remaining_cash:,.2f}) for 1 share of {res.symbol} at ${candidate_ask:,.2f} (skipped LLM call)"
+                            ],
+                            screening_result=res,
+                        )
+                        continue
                     ind_latest = float(getattr(ind, "latest_volume", 0.0) or 0.0) if ind else 0.0
                     ind_avg = float(getattr(ind, "avg_volume_20d", 0.0) or 0.0) if ind else 0.0
                     if res.symbol in normalized_cur_vols:
@@ -1581,6 +1654,7 @@ def _run_loop(
     signal.signal(signal.SIGINT, _request_stop)
 
     consecutive_errors = 0
+    had_open_market_cycle = False
     try:
         while not stop_event.is_set():
             run_kwargs: dict[str, Any] = {
@@ -1596,6 +1670,29 @@ def _run_loop(
                 _log_cycle_summary(report)
                 consecutive_errors = 0
                 wait_seconds = args.interval_seconds
+                if report.market_open and not report.skipped:
+                    had_open_market_cycle = True
+                elif report.skipped and not report.market_open and had_open_market_cycle:
+                    try:
+                        eq, pnl, positions, cash = bot._sync_broker_account_state(
+                            starting_equity=100_000.0,
+                            daily_pnl=0.0,
+                            portfolio_positions=(),
+                        )
+                        summary_fn = getattr(bot.notifier, "notify_daily_summary", None)
+                        if callable(summary_fn):
+                            summary_fn(
+                                equity=eq + pnl,
+                                daily_pnl=pnl,
+                                cash=cash,
+                                open_positions=positions,
+                            )
+                    except Exception as exc:
+                        logger.warning("Could not send end-of-day summary email: %s", exc)
+                    logger.info(
+                        "Market closed for the day after active session; daily summary sent. Exiting loop cleanly."
+                    )
+                    break
             except KeyboardInterrupt:
                 logger.info("Trading bot stopped cleanly by user interrupt.")
                 return 0
