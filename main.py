@@ -288,6 +288,8 @@ class TradingBotOrchestrator:
         self.max_ema_extension_atr = float(max_ema_extension_atr)
         self.stop_reentry_cooldown_hours: float = 24.0
         self._stop_loss_cooldowns: dict[str, datetime] = {}
+        self.ai_cache_ttl_minutes: float = 60.0
+        self._ai_signal_cache: dict[str, tuple[datetime, AnalystEvaluationResult]] = {}
 
     @property
     def screener(self) -> UniverseScreener:
@@ -620,14 +622,26 @@ class TradingBotOrchestrator:
                     screening_result=screening,
                 )
 
-        # Stage 3: AI Analyst evaluation
-        analyst_result = self.analyst.evaluate(
-            symbol=symbol,
-            current_volume=cur_vol,
-            avg_volume_20d=avg_vol,
-            news_items=news_items,
-            as_of=now_ny,
+        # Stage 3: AI Analyst evaluation (with 60-minute intraday cache in live prefilter mode)
+        cached_ai = (
+            self._ai_signal_cache.get(symbol)
+            if self.skip_ai_on_prefilter_fail and self.ai_cache_ttl_minutes > 0.0
+            else None
         )
+        if cached_ai is not None and (now_ny - cached_ai[0]) < timedelta(
+            minutes=self.ai_cache_ttl_minutes
+        ):
+            analyst_result = cached_ai[1]
+        else:
+            analyst_result = self.analyst.evaluate(
+                symbol=symbol,
+                current_volume=cur_vol,
+                avg_volume_20d=avg_vol,
+                news_items=news_items,
+                as_of=now_ny,
+            )
+            if self.skip_ai_on_prefilter_fail and self.ai_cache_ttl_minutes > 0.0:
+                self._ai_signal_cache[symbol] = (now_ny, analyst_result)
         if not analyst_result.approved:
             return TickerPipelineOutcome(
                 symbol=symbol,
@@ -1472,6 +1486,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Close specific open broker positions via protective Limit SELL orders and exit",
     )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Run walk-forward universe and wave-parameter self-calibration and exit",
+    )
+    parser.add_argument(
+        "--apply-calibration",
+        action="store_true",
+        help="Persist improved self-calibration parameters and active universe to strategy.local.json",
+    )
 
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.interval_seconds <= 0:
@@ -1778,6 +1802,67 @@ def main(
             settings=settings,
             guardian=orchestrator.guardian if orchestrator is not None else None,
         )
+
+    if args.calibrate:
+        import json as json_module
+        from src.backtest import ParquetCandleStore
+        from src.calibration import StrategySelfCalibrator
+        from src.config import DEFAULT_STRATEGY_CONFIG_PATH
+
+        cfg_path = args.config if args.config is not None else DEFAULT_STRATEGY_CONFIG_PATH
+        master_tickers: list[str] = list(resolved_tickers)
+        if Path(cfg_path).exists():
+            try:
+                raw_cfg = json_module.loads(Path(cfg_path).read_text(encoding="utf-8"))
+                if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get("master_tickers"), list):
+                    master_tickers = [
+                        str(t).strip().upper()
+                        for t in raw_cfg["master_tickers"]
+                        if str(t).strip()
+                    ]
+            except Exception:
+                pass
+
+        store = ParquetCandleStore()
+        all_syms = sorted(set(master_tickers) | set(resolved_tickers))
+        market_data = {
+            sym: store.get_or_fetch_candles(sym, period=args.backtest_period)
+            for sym in all_syms
+        }
+        vix_series = None
+        try:
+            vix_df = store.get_or_fetch_candles("^VIX", period=args.backtest_period)
+            if vix_df is not None and not vix_df.empty and "Close" in vix_df.columns:
+                vix_series = vix_df["Close"]
+        except Exception:
+            pass
+
+        calibrator = StrategySelfCalibrator()
+        cal_report = calibrator.calibrate(
+            market_data=market_data,
+            vix_series=vix_series,
+            settings=settings,
+            master_tickers=master_tickers,
+        )
+        applied = False
+        if args.apply_calibration and cal_report.improved:
+            applied = calibrator.apply_to_config_file(cal_report, config_path=cfg_path)
+
+        bm = cal_report.baseline_metrics
+        cm = cal_report.calibrated_metrics
+        cal_summary = (
+            "\n=== Self-Calibration Walk-Forward Report ===\n"
+            f"Baseline      : Trades={bm.total_trades} | WR={bm.win_rate:.2%} | PF={bm.profit_factor:.2f} | DD={bm.max_drawdown_pct:.2%} | Return={bm.total_return_pct:.2%} (Score={cal_report.baseline_score:.4f})\n"
+            f"Calibrated    : Trades={cm.total_trades} | WR={cm.win_rate:.2%} | PF={cm.profit_factor:.2f} | DD={cm.max_drawdown_pct:.2%} | Return={cm.total_return_pct:.2%} (Score={cal_report.calibrated_score:.4f})\n"
+            f"Active Tickers ({len(cal_report.active_tickers)}): {', '.join(cal_report.active_tickers)}\n"
+            f"Pruned Tickers ({len(cal_report.pruned_tickers)}): {', '.join(cal_report.pruned_tickers) or 'None'}\n"
+            f"Wave Params   : {cal_report.recommended_params}\n"
+            f"Improved      : {cal_report.improved} | Applied to Config: {applied}\n"
+            "============================================"
+        )
+        logger.info("%s", cal_summary)
+        print(cal_summary)
+        return 0
 
     if args.send_daily_summary:
         bot = orchestrator or _build_orchestrator_from_settings(

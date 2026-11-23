@@ -603,3 +603,82 @@ def test_loop_exits_cleanly_and_sends_daily_summary_when_market_closes() -> None
         cash=167.42,
         open_positions=[],
     )
+
+
+def test_self_calibrator_applies_improved_report_and_preserves_master_tickers(
+    tmp_path: Path,
+) -> None:
+    import json
+    from src.backtest import BacktestMetrics
+    from src.calibration import (
+        CalibrationReport,
+        StrategySelfCalibrator,
+        TickerCalibrationScore,
+        compute_objective_score,
+    )
+
+    base_m = BacktestMetrics(
+        total_trades=182,
+        winning_trades=82,
+        losing_trades=100,
+        win_rate=0.4505,
+        profit_factor=1.59,
+        max_drawdown_pct=0.0483,
+        total_return_pct=0.2669,
+        initial_capital=10_000.0,
+        final_equity=12_668.75,
+        compounded_pnl=2_668.75,
+        expectancy_per_trade=14.66,
+        avg_win=87.64,
+        avg_loss=-45.18,
+    )
+    cal_m = BacktestMetrics(
+        total_trades=130,
+        winning_trades=68,
+        losing_trades=62,
+        win_rate=0.5231,
+        profit_factor=2.27,
+        max_drawdown_pct=0.0480,
+        total_return_pct=0.4191,
+        initial_capital=10_000.0,
+        final_equity=14_190.87,
+        compounded_pnl=4_190.87,
+        expectancy_per_trade=32.24,
+        avg_win=109.10,
+        avg_loss=-52.06,
+    )
+    s_base = compute_objective_score(base_m)
+    s_cal = compute_objective_score(cal_m)
+    assert s_cal > s_base
+
+    cfg_file = tmp_path / "strategy.local.json"
+    cfg_file.write_text(
+        json.dumps({"tickers": ["AAPL", "DIS", "V"], "max_stop_loss_pct": 0.06}),
+        encoding="utf-8",
+    )
+    report = CalibrationReport(
+        baseline_metrics=base_m,
+        calibrated_metrics=cal_m,
+        active_tickers=("AAPL", "V"),
+        pruned_tickers=("DIS",),
+        ticker_scores=(
+            TickerCalibrationScore("AAPL", 4, 1.0, 5.0, 0.04, True, "Active"),
+            TickerCalibrationScore("DIS", 5, 0.2, 0.34, -0.02, False, "Pruned"),
+            TickerCalibrationScore("V", 6, 0.5, 3.34, 0.03, True, "Active"),
+        ),
+        recommended_params={
+            "max_stop_loss_pct": 0.06,
+            "max_ema_extension_atr": 1.2,
+            "breakeven_trigger_pct": 0.06,
+            "peak_activation_pct": 0.06,
+            "peak_rsi_threshold": 68.0,
+        },
+        baseline_score=s_base,
+        calibrated_score=s_cal,
+        improved=True,
+    )
+    assert StrategySelfCalibrator.apply_to_config_file(report, cfg_file) is True
+    updated = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert updated["master_tickers"] == ["AAPL", "DIS", "V"]
+    assert updated["tickers"] == ["AAPL", "V"]
+    assert updated["pruned_tickers"] == ["DIS"]

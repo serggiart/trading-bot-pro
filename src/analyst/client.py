@@ -157,13 +157,16 @@ def _build_analysis_prompt(
         f"- Distinct Sources ({len(sources)}): {sources_summary}\n\n"
         f"Recent News (America/New_York):\n"
         f"{formatted_articles}\n\n"
-        f"Instructions:\n"
-        f"1. Score sentiment_score in [-1.0, 1.0] and confidence_score in [0.0, 1.0].\n"
-        f"2. Count independent_sources_count strictly as distinct non-syndicated sources.\n"
-        f"3. Set volume_confirmed=true only if relative volume supports institutional participation.\n"
-        f"4. Set manipulation_risk=true if there are signs of rumor, pump-and-dump, or "
+        f"Instructions (Skeptical Institutional Risk Committee):\n"
+        f"1. Act as a skeptical institutional risk committee: penalize generic PR fluff, "
+        f"conflicting headlines, or already priced-in hype (< 0.70 confidence_score).\n"
+        f"2. Score sentiment_score in [-1.0, 1.0] and confidence_score in [0.0, 1.0]; "
+        f"reserve confidence_score >= 0.70 strictly for concrete, multi-source institutional catalysts.\n"
+        f"3. Count independent_sources_count strictly as distinct non-syndicated sources.\n"
+        f"4. Set volume_confirmed=true only if relative volume supports institutional participation.\n"
+        f"5. Set manipulation_risk=true if there are signs of rumor, pump-and-dump, or "
         f"uncorroborated hype.\n"
-        f"5. Provide a concise rationale."
+        f"6. Provide a concise rationale."
     )
 
 
