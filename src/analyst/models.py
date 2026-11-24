@@ -111,7 +111,12 @@ class AnalystConfig(BaseModel):
     min_relative_volume: float = Field(default=1.2, ge=0.0)
     model_name: str = Field(default="gemini-3.5-flash-lite", min_length=1)
     fallback_models: tuple[str, ...] = Field(
-        default=("gemini-3.8-flash", "gemini-3.7-flash", "gemini-4-hydrogen")
+        default=(
+            "gemini-3.1-flash-lite",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.8-flash",
+        )
     )
     request_timeout_ms: int = Field(default=35_000, ge=1000)
     retry_attempts: int = Field(default=1, ge=1)

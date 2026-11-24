@@ -777,34 +777,34 @@ class TradingAuditStore:
         status: str,
         broker_order_id: str | None = None,
         updated_at: datetime | None = None,
+        filled_price: float | None = None,
     ) -> bool:
-        """Update an order's status (and optional broker_order_id); return True if found."""
+        """Update an order's status (and optional broker_order_id / filled_price); return True if found."""
         cleaned_client_id = client_order_id.strip()
         cleaned_status = status.strip().lower()
         if not cleaned_client_id or not cleaned_status:
             raise ValueError("client_order_id and status must be non-empty strings")
 
         timestamp_ny = _ensure_ny_datetime(updated_at)
+        sets = ["status = ?", "updated_at = ?"]
+        params: list[Any] = [cleaned_status, timestamp_ny.isoformat()]
+        if broker_order_id is not None:
+            sets.append("broker_order_id = ?")
+            params.append(broker_order_id)
+        if filled_price is not None and filled_price > 0.0:
+            sets.append("limit_price = ?")
+            params.append(round(float(filled_price), 4))
+        params.append(cleaned_client_id)
 
         with self.transaction() as conn:
-            if broker_order_id is not None:
-                cursor = conn.execute(
-                    """
-                    UPDATE orders
-                    SET status = ?, broker_order_id = ?, updated_at = ?
-                    WHERE client_order_id = ?
-                    """,
-                    (cleaned_status, broker_order_id, timestamp_ny.isoformat(), cleaned_client_id),
-                )
-            else:
-                cursor = conn.execute(
-                    """
-                    UPDATE orders
-                    SET status = ?, updated_at = ?
-                    WHERE client_order_id = ?
-                    """,
-                    (cleaned_status, timestamp_ny.isoformat(), cleaned_client_id),
-                )
+            cursor = conn.execute(
+                f"""
+                UPDATE orders
+                SET {', '.join(sets)}
+                WHERE client_order_id = ?
+                """,
+                params,
+            )
             return cursor.rowcount > 0
 
     def get_orders(

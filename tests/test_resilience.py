@@ -725,3 +725,40 @@ def test_macro_political_and_social_news_context_filtering_and_prompt() -> None:
     )
     assert "Macro, Political, Regulatory & Social Context" in prompt
     assert "Evaluate political, geopolitical, tariff, regulatory" in prompt
+
+
+def test_reconcile_pending_orders_updates_sell_to_filled_with_exact_fill_price(
+    tmp_path: Path,
+) -> None:
+    now_ny = datetime(2026, 11, 24, 10, 0, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "sync_sells.db")
+    store.log_order(
+        client_order_id="sell-ko-1",
+        symbol="KO",
+        side="SELL",
+        qty=208.0,
+        limit_price=96.20,
+        stop_price=None,
+        status="pending_new",
+        broker_order_id="brk-sell-ko-1",
+    )
+
+    mock_tc = MagicMock()
+    mock_tc.get_orders.return_value = [
+        SimpleNamespace(
+            id="brk-sell-ko-1",
+            client_order_id="sell-ko-1",
+            symbol="KO",
+            side="sell",
+            status="filled",
+            filled_avg_price="96.57",
+        )
+    ]
+    client = AlpacaExecutionClient(audit_store=store, trading_client=mock_tc)
+    updated = client.reconcile_pending_orders(now=now_ny)
+    assert updated == 1
+
+    rec = store.get_orders(symbol="KO")[0]
+    assert rec.status == "filled"
+    assert rec.limit_price == 96.57
+    store.close()

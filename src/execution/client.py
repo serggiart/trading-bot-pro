@@ -741,6 +741,86 @@ class AlpacaExecutionClient:
             )
         return positions
 
+    def reconcile_pending_orders(
+        self,
+        now: datetime | None = None,
+    ) -> int:
+        """Sync non-terminal SQLite BUY/SELL orders with closed broker order statuses and fill prices."""
+        if self.audit_store is None or self._trading_client is None:
+            return 0
+        get_orders_fn = getattr(self._trading_client, "get_orders", None)
+        if not callable(get_orders_fn):
+            return 0
+
+        pending_statuses = {
+            "pending_new",
+            "new",
+            "accepted",
+            "submitted",
+            "partially_filled",
+        }
+        local_pending = [
+            rec
+            for rec in self.audit_store.get_orders(limit=60)
+            if rec.status in pending_statuses
+        ]
+        if not local_pending:
+            return 0
+
+        try:
+            closed_orders = (
+                get_orders_fn(
+                    filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
+                )
+                or []
+            )
+        except Exception:
+            return 0
+
+        by_client_id: dict[str, Any] = {}
+        by_broker_id: dict[str, Any] = {}
+        for bo in closed_orders:
+            cid = str(getattr(bo, "client_order_id", "") or "").strip()
+            bid = str(getattr(bo, "id", "") or "").strip()
+            if cid:
+                by_client_id[cid] = bo
+            if bid:
+                by_broker_id[bid] = bo
+
+        now_ny = ensure_ny_datetime(now)
+        updated_count = 0
+        terminal_statuses = _FILLED_ORDER_STATUSES | {
+            "canceled",
+            "cancelled",
+            "expired",
+            "rejected",
+        }
+        for rec in local_pending:
+            matched = by_client_id.get(rec.client_order_id) or (
+                by_broker_id.get(rec.broker_order_id) if rec.broker_order_id else None
+            )
+            if matched is None:
+                continue
+            status_val = _extract_broker_status(matched, default="")
+            if status_val not in terminal_statuses:
+                continue
+            fill_p = (
+                _to_float(getattr(matched, "filled_avg_price", None), default=0.0)
+                if status_val in _FILLED_ORDER_STATUSES
+                else 0.0
+            )
+            raw_bid = getattr(matched, "id", None)
+            resolved_bid = str(raw_bid) if raw_bid is not None else rec.broker_order_id
+            if self.audit_store.update_order_status(
+                client_order_id=rec.client_order_id,
+                status="filled" if status_val in _FILLED_ORDER_STATUSES else status_val,
+                broker_order_id=resolved_bid,
+                updated_at=now_ny,
+                filled_price=fill_p if fill_p > 0.0 else None,
+            ):
+                updated_count += 1
+        return updated_count
+
     def reconcile_managed_positions(
         self,
         atr_lookup: Mapping[str, float] | None = None,
@@ -750,6 +830,8 @@ class AlpacaExecutionClient:
         """Reconstruct crash-safe ManagedPositions from broker state and SQLite position_state."""
         now_ny = ensure_ny_datetime(now)
         self.last_broker_closed_positions = []
+        if type(self._trading_client) is TradingClient:
+            self.reconcile_pending_orders(now=now_ny)
         normalized_atr = {
             k.strip().upper(): float(v)
             for k, v in (atr_lookup or {}).items()
