@@ -682,3 +682,46 @@ def test_self_calibrator_applies_improved_report_and_preserves_master_tickers(
     assert updated["master_tickers"] == ["AAPL", "DIS", "V"]
     assert updated["tickers"] == ["AAPL", "V"]
     assert updated["pruned_tickers"] == ["DIS"]
+
+
+def test_macro_political_and_social_news_context_filtering_and_prompt() -> None:
+    from src.analyst.client import _build_analysis_prompt
+    from src.analyst.models import AnalystConfig
+    from src.analyst.news import NewsAggregator
+
+    now_ny = datetime(2026, 11, 23, 12, 0, tzinfo=NY_TIMEZONE)
+    mock_finnhub = MagicMock()
+    mock_finnhub.general_news.return_value = [
+        {
+            "headline": "White House announces new semiconductor export control tariffs",
+            "summary": "Geopolitical trade policy tightening impacts AI chip supply chain.",
+            "source": "Reuters",
+            "url": "https://example.com/tariffs",
+            "datetime": int(now_ny.timestamp()),
+        },
+        {
+            "headline": "Celebrity gossip unrelated to markets",
+            "summary": "Nothing about economy.",
+            "source": "Tabloid",
+            "url": "https://example.com/gossip",
+            "datetime": int(now_ny.timestamp()),
+        },
+    ]
+
+    agg = NewsAggregator(finnhub_client=mock_finnhub, news_client=MagicMock())
+    macro_items = agg.fetch_macro_context_news(max_items=5, as_of=now_ny)
+    assert len(macro_items) == 1
+    assert "tariffs" in macro_items[0].headline.lower()
+
+    prompt = _build_analysis_prompt(
+        symbol="NVDA",
+        current_volume=2_000_000,
+        avg_volume_20d=1_000_000,
+        relative_volume=2.0,
+        news_items=macro_items,
+        sources=["Reuters"],
+        config=AnalystConfig(),
+        macro_news_items=macro_items,
+    )
+    assert "Macro, Political, Regulatory & Social Context" in prompt
+    assert "Evaluate political, geopolitical, tariff, regulatory" in prompt

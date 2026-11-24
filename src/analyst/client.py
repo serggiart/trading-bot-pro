@@ -126,6 +126,7 @@ def _build_analysis_prompt(
     news_items: Sequence[NewsItem],
     sources: Sequence[str],
     config: AnalystConfig,
+    macro_news_items: Sequence[NewsItem] = (),
 ) -> str:
     """Build a concise, deterministic prompt for Gemini structured evaluation."""
     prompt_items = _select_prompt_articles(news_items, config.max_prompt_articles)
@@ -145,6 +146,24 @@ def _build_analysis_prompt(
     else:
         formatted_articles = "- No recent news articles found in the lookback window."
 
+    macro_section = ""
+    if macro_news_items:
+        formatted_macro = "\n".join(
+            (
+                f"- [{item.published_at.isoformat()}] ({item.source}) {item.headline}"
+                + (
+                    f" — {_truncate_text(item.summary, 160)}"
+                    if item.summary
+                    else ""
+                )
+            )
+            for item in list(macro_news_items)[:5]
+        )
+        macro_section = (
+            f"Macro, Political, Regulatory & Social Context (General Market Feed):\n"
+            f"{formatted_macro}\n\n"
+        )
+
     sources_summary = ", ".join(sources) if sources else "None"
     return (
         f"Evaluate equity ticker {symbol} for trading signal quality and disinformation risk.\n"
@@ -157,16 +176,20 @@ def _build_analysis_prompt(
         f"- Distinct Sources ({len(sources)}): {sources_summary}\n\n"
         f"Recent News (America/New_York):\n"
         f"{formatted_articles}\n\n"
+        f"{macro_section}"
         f"Instructions (Skeptical Institutional Risk Committee):\n"
         f"1. Act as a skeptical institutional risk committee: penalize generic PR fluff, "
         f"conflicting headlines, or already priced-in hype (< 0.70 confidence_score).\n"
-        f"2. Score sentiment_score in [-1.0, 1.0] and confidence_score in [0.0, 1.0]; "
+        f"2. Evaluate political, geopolitical, tariff, regulatory (Fed, DOJ, FTC, FDA, SEC), "
+        f"and social/consumer-trend impacts on {symbol} and its sector; penalize active political "
+        f"or social headwinds (< 0.70) and reward confirmed policy/social tailwinds.\n"
+        f"3. Score sentiment_score in [-1.0, 1.0] and confidence_score in [0.0, 1.0]; "
         f"reserve confidence_score >= 0.70 strictly for concrete, multi-source institutional catalysts.\n"
-        f"3. Count independent_sources_count strictly as distinct non-syndicated sources.\n"
-        f"4. Set volume_confirmed=true only if relative volume supports institutional participation.\n"
-        f"5. Set manipulation_risk=true if there are signs of rumor, pump-and-dump, or "
+        f"4. Count independent_sources_count strictly as distinct non-syndicated sources.\n"
+        f"5. Set volume_confirmed=true only if relative volume supports institutional participation.\n"
+        f"6. Set manipulation_risk=true if there are signs of rumor, pump-and-dump, or "
         f"uncorroborated hype.\n"
-        f"6. Provide a concise rationale."
+        f"7. Provide a concise rationale."
     )
 
 
@@ -298,6 +321,15 @@ class GeminiAnalyst:
             items = NewsAggregator.deduplicate(news_items)
 
         sources = NewsAggregator.distinct_sources(items)
+        macro_items: Sequence[NewsItem] = ()
+        fetch_macro_fn = getattr(self.news_aggregator, "fetch_macro_context_news", None)
+        if callable(fetch_macro_fn):
+            try:
+                fetched_macro = fetch_macro_fn(as_of=as_of)
+                if isinstance(fetched_macro, list):
+                    macro_items = fetched_macro
+            except Exception:
+                macro_items = ()
         prompt = _build_analysis_prompt(
             symbol=normalized_symbol,
             current_volume=float(current_volume),
@@ -306,6 +338,7 @@ class GeminiAnalyst:
             news_items=items,
             sources=sources,
             config=self.config,
+            macro_news_items=macro_items,
         )
 
         client = self._get_client()

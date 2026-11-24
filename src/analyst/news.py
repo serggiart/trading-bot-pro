@@ -17,6 +17,50 @@ from src.analyst.models import NY_TIMEZONE, NewsItem, normalize_ny_datetime
 
 logger = logging.getLogger(__name__)
 
+_MACRO_POLITICAL_SOCIAL_KEYWORDS: tuple[str, ...] = (
+    "tariff",
+    "tariffs",
+    "white house",
+    "congress",
+    "senate",
+    "president",
+    "election",
+    "geopolit",
+    "sanction",
+    "export control",
+    "china",
+    "taiwan",
+    "middle east",
+    "oil",
+    "opec",
+    "fed",
+    "fomc",
+    "powell",
+    "interest rate",
+    "inflation",
+    "cpi",
+    "treasury",
+    "antitrust",
+    "doj",
+    "ftc",
+    "fda",
+    "sec",
+    "regulation",
+    "regulatory",
+    "subsidy",
+    "defense",
+    "pentagon",
+    "boycott",
+    "strike",
+    "union",
+    "consumer sentiment",
+    "consumer spending",
+    "social",
+    "viral",
+    "layoff",
+    "tax",
+)
+
 
 def _normalize_symbol(symbol: str) -> str:
     cleaned = symbol.strip().upper()
@@ -104,6 +148,8 @@ class NewsAggregator:
                 if resolved_alpaca_key and resolved_alpaca_secret
                 else None
             )
+        self._macro_cache_ts: datetime | None = None
+        self._macro_cache_items: list[NewsItem] = []
 
     def fetch_finnhub_news(
         self,
@@ -257,3 +303,62 @@ class NewsAggregator:
                 )
 
         return self.deduplicate(collected)
+
+    def fetch_macro_context_news(
+        self,
+        max_items: int = 5,
+        as_of: datetime | None = None,
+        cache_ttl_minutes: float = 30.0,
+    ) -> list[NewsItem]:
+        """Fetch and filter macro, political, regulatory, geopolitical, and social-trend news."""
+        if max_items <= 0 or self.finnhub_client is None:
+            return []
+        general_fn = getattr(self.finnhub_client, "general_news", None)
+        if not callable(general_fn):
+            return []
+
+        now_ny = normalize_ny_datetime(as_of) if as_of is not None else datetime.now(NY_TIMEZONE)
+        if (
+            self._macro_cache_ts is not None
+            and (now_ny - self._macro_cache_ts).total_seconds() < cache_ttl_minutes * 60.0
+        ):
+            return list(self._macro_cache_items[:max_items])
+
+        try:
+            raw_articles = general_fn("general", min_id=0)
+        except Exception as exc:
+            logger.debug("Macro general_news fetch skipped: %s", exc)
+            return []
+
+        if not isinstance(raw_articles, list):
+            return []
+
+        matched: list[NewsItem] = []
+        for entry in raw_articles:
+            if not isinstance(entry, dict):
+                continue
+            headline = str(entry.get("headline") or "").strip()
+            if not headline:
+                continue
+            summary = str(entry.get("summary") or "").strip()
+            combined_lower = f"{headline} {summary}".lower()
+            if not any(kw in combined_lower for kw in _MACRO_POLITICAL_SOCIAL_KEYWORDS):
+                continue
+            source = str(entry.get("source") or "finnhub").strip() or "finnhub"
+            url = str(entry.get("url") or "").strip()
+            raw_dt = entry.get("datetime")
+            matched.append(
+                NewsItem(
+                    headline=headline,
+                    summary=summary,
+                    source=source,
+                    url=url,
+                    published_at=normalize_ny_datetime(raw_dt),
+                    provider="finnhub",
+                )
+            )
+
+        deduped = self.deduplicate(matched)
+        self._macro_cache_ts = now_ny
+        self._macro_cache_items = deduped
+        return list(deduped[:max_items])

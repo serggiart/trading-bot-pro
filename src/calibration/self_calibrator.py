@@ -13,7 +13,7 @@ import pandas as pd
 
 from src.backtest import BacktestConfig, BacktestEngine, BacktestMetrics
 from src.config import DEFAULT_STRATEGY_CONFIG_PATH, StrategySettings
-from src.guardian import RiskGuardian
+from src.guardian import GuardianConfig, RiskGuardian
 from src.universe import compute_return_correlation_matrix
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,17 @@ class CalibrationReport:
     baseline_score: float
     calibrated_score: float
     improved: bool
+
+
+def _guardian_for_settings(settings: StrategySettings) -> RiskGuardian:
+    return RiskGuardian(
+        GuardianConfig(
+            risk_per_trade_pct=settings.risk_per_trade_pct,
+            max_asset_exposure_pct=settings.max_asset_exposure_pct,
+            max_sector_exposure_pct=settings.max_sector_exposure_pct,
+            kelly_fraction=settings.kelly_fraction,
+        )
+    )
 
 
 def compute_objective_score(metrics: BacktestMetrics) -> float:
@@ -235,7 +246,7 @@ class StrategySelfCalibrator:
             peak_rsi_threshold=settings.peak_rsi_threshold,
         )
         baseline_metrics = (
-            BacktestEngine(guardian=RiskGuardian(), config=baseline_cfg)
+            BacktestEngine(guardian=_guardian_for_settings(settings), config=baseline_cfg)
             .run(
                 current_md,
                 vix_series=vix_series,
@@ -315,7 +326,7 @@ class StrategySelfCalibrator:
                 peak_rsi_threshold=float(candidate["peak_rsi_threshold"]),
             )
             metrics = (
-                BacktestEngine(guardian=RiskGuardian(), config=cfg)
+                BacktestEngine(guardian=_guardian_for_settings(settings), config=cfg)
                 .run(
                     active_md,
                     vix_series=vix_series,

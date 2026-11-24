@@ -36,6 +36,10 @@ class StrategySettings:
     peak_activation_pct: float = 0.0
     peak_pullback_pct: float = 0.0
     peak_rsi_threshold: float = 66.0
+    risk_per_trade_pct: float = 0.01
+    max_asset_exposure_pct: float = 0.20
+    max_sector_exposure_pct: float = 0.35
+    kelly_fraction: float = 0.25
     confirmation_delay_minutes: float = 2.0
     max_confirmation_delay_minutes: float = 5.0
     default_sector: str = "Technology"
@@ -72,6 +76,14 @@ class StrategySettings:
             raise ValueError("peak_pullback_pct must be in [0, 1)")
         if not 0.0 < self.peak_rsi_threshold <= 100.0:
             raise ValueError("peak_rsi_threshold must be in (0, 100]")
+        if not 0.0 < self.risk_per_trade_pct <= 0.05:
+            raise ValueError("risk_per_trade_pct must be in (0, 0.05]")
+        if not 0.0 < self.max_asset_exposure_pct <= 1.0:
+            raise ValueError("max_asset_exposure_pct must be in (0, 1]")
+        if not 0.0 < self.max_sector_exposure_pct <= 1.0:
+            raise ValueError("max_sector_exposure_pct must be in (0, 1]")
+        if not 0.0 < self.kelly_fraction <= 1.0:
+            raise ValueError("kelly_fraction must be in (0, 1]")
         if self.confirmation_delay_minutes < 0.0:
             raise ValueError("confirmation_delay_minutes must be non-negative")
         if self.max_confirmation_delay_minutes < self.confirmation_delay_minutes:
@@ -164,6 +176,18 @@ def load_strategy_settings(
         ),
         peak_rsi_threshold=float(
             raw_data.get("peak_rsi_threshold", defaults.peak_rsi_threshold)
+        ),
+        risk_per_trade_pct=float(
+            raw_data.get("risk_per_trade_pct", defaults.risk_per_trade_pct)
+        ),
+        max_asset_exposure_pct=float(
+            raw_data.get("max_asset_exposure_pct", defaults.max_asset_exposure_pct)
+        ),
+        max_sector_exposure_pct=float(
+            raw_data.get("max_sector_exposure_pct", defaults.max_sector_exposure_pct)
+        ),
+        kelly_fraction=float(
+            raw_data.get("kelly_fraction", defaults.kelly_fraction)
         ),
         confirmation_delay_minutes=float(
             raw_data.get("confirmation_delay_minutes", defaults.confirmation_delay_minutes)

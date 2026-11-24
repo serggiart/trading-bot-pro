@@ -1549,7 +1549,27 @@ def _run_backtest_cli(
     if settings.peak_rsi_threshold != 66.0:
         bt_kwargs["peak_rsi_threshold"] = settings.peak_rsi_threshold
     config = BacktestConfig(**bt_kwargs)
-    engine = BacktestEngine(guardian=guardian or RiskGuardian(), config=config)
+    resolved_guardian = guardian
+    if resolved_guardian is None:
+        if (
+            settings.risk_per_trade_pct != 0.01
+            or settings.max_asset_exposure_pct != 0.20
+            or settings.max_sector_exposure_pct != 0.35
+            or settings.kelly_fraction != 0.25
+        ):
+            from src.guardian import GuardianConfig
+
+            resolved_guardian = RiskGuardian(
+                GuardianConfig(
+                    risk_per_trade_pct=settings.risk_per_trade_pct,
+                    max_asset_exposure_pct=settings.max_asset_exposure_pct,
+                    max_sector_exposure_pct=settings.max_sector_exposure_pct,
+                    kelly_fraction=settings.kelly_fraction,
+                )
+            )
+        else:
+            resolved_guardian = RiskGuardian()
+    engine = BacktestEngine(guardian=resolved_guardian, config=config)
     corr_matrix = compute_return_correlation_matrix(market_data)
     report = engine.run(
         market_data=market_data,
@@ -1614,9 +1634,20 @@ def _build_orchestrator_from_settings(
         audit_store=audit_store,
         config=AnalystConfig(min_relative_volume=settings.min_relative_volume),
     )
+    from src.guardian import GuardianConfig
+
+    guardian = RiskGuardian(
+        GuardianConfig(
+            risk_per_trade_pct=settings.risk_per_trade_pct,
+            max_asset_exposure_pct=settings.max_asset_exposure_pct,
+            max_sector_exposure_pct=settings.max_sector_exposure_pct,
+            kelly_fraction=settings.kelly_fraction,
+        )
+    )
     return TradingBotOrchestrator(
         screener=screener,
         analyst=analyst,
+        guardian=guardian,
         execution_client=execution_client,
         position_manager=position_manager,
         audit_store=audit_store,
