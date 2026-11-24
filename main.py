@@ -1815,12 +1815,12 @@ def _run_eod_auto_calibration(
     store = ParquetCandleStore()
     all_syms = sorted(set(master_tickers) | set(settings.tickers))
     market_data = {
-        sym: store.get_or_fetch_candles(sym, period="3y", force_refresh=True)
+        sym: store.get_or_fetch_candles(sym, period="3y", refresh=True)
         for sym in all_syms
     }
     vix_series = None
     try:
-        vix_df = store.get_or_fetch_candles("^VIX", period="3y", force_refresh=True)
+        vix_df = store.get_or_fetch_candles("^VIX", period="3y", refresh=True)
         if vix_df is not None and not vix_df.empty and "Close" in vix_df.columns:
             vix_series = vix_df["Close"]
     except Exception:
