@@ -480,15 +480,14 @@ class AlpacaExecutionClient:
 
         client = self._require_trading_client()
         broker_order = None
-        for attempt in range(4):
+        for attempt in range(10):
             try:
                 broker_order = client.submit_order(order_data=order_request)
                 break
             except Exception as exc:
                 err_lower = str(exc).lower()
                 is_held_race = (
-                    cancelled_order_ids
-                    and attempt < 3
+                    attempt < 9
                     and type(client) is TradingClient
                     and (
                         "held_for_orders" in err_lower
@@ -499,7 +498,7 @@ class AlpacaExecutionClient:
                     raise
                 import time
 
-                time.sleep(0.35 * (attempt + 1))
+                time.sleep(0.5 + 0.25 * attempt)
         raw_broker_id = getattr(broker_order, "id", None)
         broker_order_id = str(raw_broker_id) if raw_broker_id is not None else None
         status = _extract_broker_status(broker_order, default="submitted")
