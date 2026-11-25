@@ -107,6 +107,7 @@ class AnalystConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     min_confidence: float = Field(default=0.70, ge=0.0, le=1.0)
+    min_sentiment_score: float = Field(default=-0.10, ge=-1.0, le=1.0)
     min_independent_sources: int = Field(default=3, ge=1)
     min_relative_volume: float = Field(default=1.2, ge=0.0)
     model_name: str = Field(default="gemini-3.5-flash-lite", min_length=1)

@@ -55,6 +55,10 @@ def evaluate_report_gates(
 ) -> list[str]:
     """Apply deterministic anti-desinformation and risk gates to an AI AnalystReport."""
     reasons: list[str] = []
+    if report.sentiment_score < config.min_sentiment_score:
+        reasons.append(
+            f"sentiment_score {report.sentiment_score:.2f} < {config.min_sentiment_score:.2f} (non-bullish sentiment)"
+        )
     if report.confidence_score < config.min_confidence:
         reasons.append(
             f"confidence_score {report.confidence_score:.2f} < {config.min_confidence:.2f}"

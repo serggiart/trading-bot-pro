@@ -1632,7 +1632,10 @@ def _build_orchestrator_from_settings(
     )
     analyst = GeminiAnalyst(
         audit_store=audit_store,
-        config=AnalystConfig(min_relative_volume=settings.min_relative_volume),
+        config=AnalystConfig(
+            min_relative_volume=settings.min_relative_volume,
+            min_sentiment_score=0.10,
+        ),
     )
     from src.guardian import GuardianConfig
 

@@ -762,3 +762,37 @@ def test_reconcile_pending_orders_updates_sell_to_filled_with_exact_fill_price(
     assert rec.status == "filled"
     assert rec.limit_price == 96.57
     store.close()
+
+
+def test_bearish_sentiment_blocks_buy_even_with_high_confidence(tmp_path: Path) -> None:
+    from src.analyst import AnalystConfig, AnalystReport, GeminiAnalyst, NewsAggregator
+
+    store = TradingAuditStore(tmp_path / "bearish_gate.db")
+    bearish_report = AnalystReport(
+        ticker="AMZN",
+        sentiment_score=-0.65,
+        confidence_score=0.85,
+        independent_sources_count=4,
+        volume_confirmed=True,
+        manipulation_risk=False,
+        rationale="Amazon facing downward pressure amid broader tech sell-off.",
+    )
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value = SimpleNamespace(
+        parsed=bearish_report
+    )
+    analyst = GeminiAnalyst(
+        audit_store=store,
+        news_aggregator=MagicMock(spec=NewsAggregator),
+        client=mock_client,
+        config=AnalystConfig(min_sentiment_score=0.10),
+    )
+    res = analyst.evaluate(
+        symbol="AMZN",
+        current_volume=2_000_000,
+        avg_volume_20d=1_000_000,
+        news_items=[],
+    )
+    assert res.approved is False
+    assert any("sentiment_score" in r for r in res.rejection_reasons)
+    store.close()
