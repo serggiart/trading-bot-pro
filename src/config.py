@@ -40,6 +40,7 @@ class StrategySettings:
     max_asset_exposure_pct: float = 0.20
     max_sector_exposure_pct: float = 0.35
     kelly_fraction: float = 0.25
+    allow_fractional_shares: bool = False
     confirmation_delay_minutes: float = 2.0
     max_confirmation_delay_minutes: float = 5.0
     default_sector: str = "Technology"
@@ -188,6 +189,9 @@ def load_strategy_settings(
         ),
         kelly_fraction=float(
             raw_data.get("kelly_fraction", defaults.kelly_fraction)
+        ),
+        allow_fractional_shares=bool(
+            raw_data.get("allow_fractional_shares", defaults.allow_fractional_shares)
         ),
         confirmation_delay_minutes=float(
             raw_data.get("confirmation_delay_minutes", defaults.confirmation_delay_minutes)

@@ -26,6 +26,7 @@ class BacktestConfig:
     breakeven_trigger_pct: float = 0.0
     peak_activation_pct: float = 0.0
     peak_rsi_threshold: float = 66.0
+    allow_fractional_shares: bool = False
     cache_dir: Path = Path("data/candles")
 
     def __post_init__(self) -> None:
@@ -66,7 +67,7 @@ class SimulatedTrade:
     exit_date: str
     entry_price: float
     exit_price: float
-    shares: int
+    shares: float
     stop_price: float
     take_profit_price: float
     pnl: float

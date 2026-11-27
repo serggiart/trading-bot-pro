@@ -217,7 +217,7 @@ class _OpenPosition:
     sector: str
     entry_date: str
     entry_price: float
-    shares: int
+    shares: float
     initial_stop_price: float
     stop_price: float
     take_profit_price: float
@@ -543,12 +543,13 @@ class BacktestEngine:
 
             for _, sym, p, bar_close, bar_atr in day_candidates:
                 entry_price = bar_close * (1.0 + self.config.slippage_pct)
+                scale = 1000.0 if self.config.allow_fractional_shares else 1.0
                 portfolio_positions = [
                     PortfolioPosition(
                         symbol=open_pos.symbol,
                         sector=open_pos.sector,
-                        market_value=open_pos.shares * last_known_close[open_pos.symbol],
-                        shares=float(open_pos.shares),
+                        market_value=open_pos.shares * last_known_close[open_pos.symbol] * scale,
+                        shares=float(open_pos.shares) * scale,
                         avg_price=open_pos.entry_price,
                     )
                     for open_pos in open_positions.values()
@@ -562,9 +563,9 @@ class BacktestEngine:
                 context = MarketContext(
                     now=bar_dt,
                     vix=bar_vix,
-                    starting_equity=day_start_equity,
-                    daily_pnl=daily_pnl,
-                    available_capital=cash,
+                    starting_equity=day_start_equity * scale,
+                    daily_pnl=daily_pnl * scale,
+                    available_capital=cash * scale,
                     portfolio_positions=portfolio_positions,
                     correlation_matrix=correlation_matrix or {},
                 )
@@ -574,12 +575,20 @@ class BacktestEngine:
                     vetoed_entries_count += 1
                     continue
 
-                shares = decision.recommended_shares
-                if shares * entry_price > cash:
-                    shares = math.floor(cash / entry_price)
-                if shares <= 0:
-                    vetoed_entries_count += 1
-                    continue
+                if self.config.allow_fractional_shares:
+                    shares: float = round(decision.recommended_shares / scale, 4)
+                    if shares * entry_price > cash:
+                        shares = round(max(0.0, (cash * 0.999) / entry_price), 4)
+                    if shares * entry_price < 10.0 or shares <= 0.0:
+                        vetoed_entries_count += 1
+                        continue
+                else:
+                    shares = decision.recommended_shares
+                    if shares * entry_price > cash:
+                        shares = math.floor(cash / entry_price)
+                    if shares <= 0:
+                        vetoed_entries_count += 1
+                        continue
 
                 initial_stop = max(
                     0.0, entry_price - bar_atr * self.config.atr_stop_multiplier

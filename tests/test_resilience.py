@@ -796,3 +796,105 @@ def test_bearish_sentiment_blocks_buy_even_with_high_confidence(tmp_path: Path) 
     assert res.approved is False
     assert any("sentiment_score" in r for r in res.rejection_reasons)
     store.close()
+
+
+def test_fractional_limit_buy_uses_simple_day_order_and_skips_broker_gtc_stop(
+    tmp_path: Path,
+) -> None:
+    from alpaca.trading.enums import OrderClass, TimeInForce
+
+    now_ny = datetime(2026, 11, 27, 10, 30, tzinfo=NY_TIMEZONE)
+    store = TradingAuditStore(tmp_path / "fractional_exec.db")
+    mock_tc = MagicMock()
+    mock_tc.submit_order.return_value = SimpleNamespace(
+        id="brk-frac-v-1",
+        status="filled",
+        legs=None,
+    )
+    client = AlpacaExecutionClient(audit_store=store, trading_client=mock_tc)
+
+    res = client.submit_limit_buy(
+        symbol="V",
+        qty=0.523,
+        ask_price=430.00,
+        stop_loss_price=404.20,
+        take_profit_price=460.00,
+        dry_run=False,
+    )
+    assert res.submitted is True
+    submitted_req = mock_tc.submit_order.call_args.kwargs["order_data"]
+    assert submitted_req.qty == pytest.approx(0.523)
+    assert submitted_req.time_in_force == TimeInForce.DAY
+    assert submitted_req.order_class in (None, OrderClass.SIMPLE)
+    assert submitted_req.stop_loss is None
+    assert submitted_req.take_profit is None
+
+    # Fractional open position skips broker GTC STOP_LIMIT submission during reconcile
+    mock_tc.get_all_positions.return_value = [
+        SimpleNamespace(
+            symbol="V",
+            qty="0.523",
+            avg_entry_price="430.00",
+            current_price="432.00",
+            market_value="225.94",
+        )
+    ]
+    mock_tc.get_orders.return_value = []
+    mock_tc.submit_order.reset_mock()
+
+    reconciled = client.reconcile_managed_positions(
+        now=now_ny,
+        ensure_protective_stops=True,
+    )
+    assert len(reconciled) == 1
+    assert reconciled[0].qty == pytest.approx(0.523)
+    mock_tc.submit_order.assert_not_called()
+    store.close()
+
+
+def test_fractional_backtest_unlocks_500_usd_account() -> None:
+    import numpy as np
+    import pandas as pd
+    from src.backtest import BacktestConfig, BacktestEngine
+    from src.guardian import GuardianConfig, RiskGuardian
+
+    dates = pd.bdate_range("2025-01-02", periods=260)
+    # Trending $450+ stock where a $500 account cannot buy 1 whole share under 45% cap ($225 max)
+    base = 450.0 + np.linspace(0.0, 40.0, len(dates))
+    # Create a controlled pullback (bars 210-217) followed by a volume-backed bounce above EMA(20)
+    trend = base.copy()
+    trend[210:218] -= np.linspace(1.0, 8.0, 8)
+    trend[218:221] = base[218:221] + np.array([1.0, 2.0, 3.0])
+    vols = np.full(len(dates), 1_000_000.0)
+    vols[218:225] = 2_000_000.0
+    df = pd.DataFrame(
+        {
+            "Open": trend * 0.998,
+            "High": trend * 1.01,
+            "Low": trend * 0.99,
+            "Close": trend,
+            "Volume": vols,
+        },
+        index=dates,
+    )
+
+    guardian = RiskGuardian(
+        GuardianConfig(
+            risk_per_trade_pct=0.02,
+            max_asset_exposure_pct=0.45,
+            max_sector_exposure_pct=0.50,
+            kelly_fraction=0.45,
+        )
+    )
+    whole_rep = BacktestEngine(
+        guardian=guardian,
+        config=BacktestConfig(initial_capital=500.0, rsi_entry_max=70.0, allow_fractional_shares=False),
+    ).run({"V": df}, sector_map={"V": "Financials"})
+    frac_rep = BacktestEngine(
+        guardian=guardian,
+        config=BacktestConfig(initial_capital=500.0, rsi_entry_max=70.0, allow_fractional_shares=True),
+    ).run({"V": df}, sector_map={"V": "Financials"})
+
+    assert whole_rep.metrics.total_trades == 0
+    assert frac_rep.metrics.total_trades >= 1
+    assert any(abs(t.shares - round(t.shares)) > 1e-6 for t in frac_rep.trades)

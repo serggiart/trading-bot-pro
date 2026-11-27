@@ -262,6 +262,7 @@ class TradingBotOrchestrator:
         skip_ai_on_prefilter_fail: bool = False,
         max_stop_loss_pct: float = 0.0,
         max_ema_extension_atr: float = 0.0,
+        allow_fractional_shares: bool = False,
     ) -> None:
         self.audit_store = audit_store or TradingAuditStore()
         self.guardian = guardian or RiskGuardian()
@@ -286,6 +287,7 @@ class TradingBotOrchestrator:
         self.skip_ai_on_prefilter_fail = bool(skip_ai_on_prefilter_fail)
         self.max_stop_loss_pct = float(max_stop_loss_pct)
         self.max_ema_extension_atr = float(max_ema_extension_atr)
+        self.allow_fractional_shares = bool(allow_fractional_shares)
         self.stop_reentry_cooldown_hours: float = 24.0
         self._stop_loss_cooldowns: dict[str, datetime] = {}
         self.ai_cache_ttl_minutes: float = 60.0
@@ -574,21 +576,29 @@ class TradingBotOrchestrator:
         # already fails hard anti-disinformation thresholds.
         if self.skip_ai_on_prefilter_fail and isinstance(analyst_config, AnalystConfig):
             prefilter_reasons: list[str] = []
-            if (
-                available_capital is not None
-                and ask_price > 0.0
-                and available_capital < ask_price
-            ):
-                return TickerPipelineOutcome(
-                    symbol=symbol,
-                    stage_reached="cash_prefilter",
-                    status="skipped_insufficient_cash",
-                    approved=False,
-                    reasons=[
-                        f"Insufficient cash (${available_capital:,.2f}) for 1 share of {symbol} at ${ask_price:,.2f} (skipped LLM call)"
-                    ],
-                    screening_result=screening,
-                )
+            if available_capital is not None and ask_price > 0.0:
+                if self.allow_fractional_shares and available_capital < 10.0:
+                    return TickerPipelineOutcome(
+                        symbol=symbol,
+                        stage_reached="cash_prefilter",
+                        status="skipped_insufficient_cash",
+                        approved=False,
+                        reasons=[
+                            f"Insufficient cash (${available_capital:,.2f} < $10.00 minimum fractional order; skipped LLM call)"
+                        ],
+                        screening_result=screening,
+                    )
+                if not self.allow_fractional_shares and available_capital < ask_price:
+                    return TickerPipelineOutcome(
+                        symbol=symbol,
+                        stage_reached="cash_prefilter",
+                        status="skipped_insufficient_cash",
+                        approved=False,
+                        reasons=[
+                            f"Insufficient cash (${available_capital:,.2f}) for 1 share of {symbol} at ${ask_price:,.2f} (skipped LLM call)"
+                        ],
+                        screening_result=screening,
+                    )
             if (
                 self.max_ema_extension_atr > 0.0
                 and indicators.ema_20 > 0.0
@@ -667,20 +677,40 @@ class TradingBotOrchestrator:
             earnings_dates=earnings_dts,
             side="BUY",
         )
+        scale = 1000.0 if self.allow_fractional_shares else 1.0
+        scaled_portfolio = (
+            [
+                PortfolioPosition(
+                    symbol=pos.symbol,
+                    sector=pos.sector,
+                    market_value=pos.effective_market_value * scale,
+                    shares=float(pos.shares) * scale,
+                    avg_price=pos.avg_price,
+                )
+                for pos in portfolio_positions
+            ]
+            if self.allow_fractional_shares
+            else portfolio_positions
+        )
         context = MarketContext(
             now=now_ny,
             vix=indicators.vix,
-            starting_equity=starting_equity,
-            daily_pnl=daily_pnl,
-            portfolio_positions=portfolio_positions,
+            starting_equity=starting_equity * scale,
+            daily_pnl=daily_pnl * scale,
+            portfolio_positions=scaled_portfolio,
             correlation_matrix=correlation_matrix,
             fed_dates=fed_dates,
             earnings_dates=earnings_dts,
         )
         decision = self.guardian.evaluate(candidate, context)
 
+        resolved_shares: float = (
+            round(decision.recommended_shares / scale, 4)
+            if self.allow_fractional_shares
+            else float(decision.recommended_shares)
+        )
         recommended_notional = (
-            decision.position_size.position_value
+            (decision.position_size.position_value / scale)
             if decision.position_size is not None
             else None
         )
@@ -690,7 +720,7 @@ class TradingBotOrchestrator:
             approved=decision.approved,
             veto_reasons=decision.veto_reasons,
             vix=indicators.vix,
-            recommended_shares=float(decision.recommended_shares),
+            recommended_shares=float(resolved_shares),
             recommended_notional=recommended_notional,
             metadata={
                 "dry_run": dry_run,
@@ -735,23 +765,46 @@ class TradingBotOrchestrator:
                 ask_price + self.take_profit_atr_multiplier * indicators.atr_14,
                 2,
             )
-        order_shares = decision.recommended_shares
-        if available_capital is not None:
-            affordable = math.floor(max(0.0, available_capital) / ask_price) if ask_price > 0.0 else 0
-            order_shares = min(order_shares, affordable)
-            if order_shares <= 0:
+        if self.allow_fractional_shares:
+            order_shares: float = resolved_shares
+            if available_capital is not None:
+                affordable = (
+                    round(max(0.0, (available_capital * 0.995) / ask_price), 4)
+                    if ask_price > 0.0
+                    else 0.0
+                )
+                order_shares = min(order_shares, affordable)
+            if order_shares <= 0.0 or order_shares * ask_price < 10.0:
                 return TickerPipelineOutcome(
                     symbol=symbol,
                     stage_reached="cash_prefilter",
                     status="skipped_insufficient_cash",
                     approved=False,
                     reasons=[
-                        f"Insufficient cash (${available_capital:,.2f}) for {symbol} at ${ask_price:,.2f} (margin disabled)"
+                        f"Insufficient cash (${available_capital or 0.0:,.2f}) for fractional {symbol} at ${ask_price:,.2f} (< $10.00 min)"
                     ],
                     screening_result=screening,
                     analyst_result=analyst_result,
                     guardian_decision=decision,
                 )
+        else:
+            order_shares = decision.recommended_shares
+            if available_capital is not None:
+                affordable = math.floor(max(0.0, available_capital) / ask_price) if ask_price > 0.0 else 0
+                order_shares = min(order_shares, affordable)
+                if order_shares <= 0:
+                    return TickerPipelineOutcome(
+                        symbol=symbol,
+                        stage_reached="cash_prefilter",
+                        status="skipped_insufficient_cash",
+                        approved=False,
+                        reasons=[
+                            f"Insufficient cash (${available_capital:,.2f}) for {symbol} at ${ask_price:,.2f} (margin disabled)"
+                        ],
+                        screening_result=screening,
+                        analyst_result=analyst_result,
+                        guardian_decision=decision,
+                    )
 
         order_result = self.execution_client.submit_limit_buy(
             symbol=symbol,
@@ -1003,9 +1056,10 @@ class TradingBotOrchestrator:
         cleaned_symbols = [raw.strip().upper() for raw in symbols if raw.strip()]
 
         # Cash-only guard: skip new entry scanning when broker cash is exhausted (no margin buying)
-        if remaining_cash is not None and remaining_cash < 100.0:
+        min_cash = 15.0 if self.allow_fractional_shares else 100.0
+        if remaining_cash is not None and remaining_cash < min_cash:
             cash_reason = (
-                f"Insufficient available cash (${remaining_cash:,.2f} < $100.00; "
+                f"Insufficient available cash (${remaining_cash:,.2f} < ${min_cash:,.2f}; "
                 "margin disabled — monitoring open positions only)"
             )
             logger.info("%s", cash_reason)
@@ -1212,7 +1266,8 @@ class TradingBotOrchestrator:
                         else (ind.current_price if ind is not None else 0.0)
                     )
                     if (
-                        remaining_cash is not None
+                        not self.allow_fractional_shares
+                        and remaining_cash is not None
                         and candidate_ask > 0.0
                         and remaining_cash < candidate_ask
                     ):
@@ -1326,7 +1381,8 @@ class TradingBotOrchestrator:
                     )
                     continue
 
-            if remaining_cash is not None and remaining_cash < 100.0:
+            min_cash = 15.0 if self.allow_fractional_shares else 100.0
+            if remaining_cash is not None and remaining_cash < min_cash:
                 outcomes.append(
                     TickerPipelineOutcome(
                         symbol=symbol,
@@ -1334,7 +1390,7 @@ class TradingBotOrchestrator:
                         status="skipped_insufficient_cash",
                         approved=False,
                         reasons=[
-                            f"Insufficient remaining cash (${remaining_cash:,.2f} < $100.00; skipped LLM call)"
+                            f"Insufficient remaining cash (${remaining_cash:,.2f} < ${min_cash:,.2f}; skipped LLM call)"
                         ],
                         screening_result=pre_screened,
                     )
@@ -1548,6 +1604,8 @@ def _run_backtest_cli(
         bt_kwargs["peak_activation_pct"] = settings.peak_activation_pct
     if settings.peak_rsi_threshold != 66.0:
         bt_kwargs["peak_rsi_threshold"] = settings.peak_rsi_threshold
+    if settings.allow_fractional_shares:
+        bt_kwargs["allow_fractional_shares"] = True
     config = BacktestConfig(**bt_kwargs)
     resolved_guardian = guardian
     if resolved_guardian is None:
@@ -1665,6 +1723,7 @@ def _build_orchestrator_from_settings(
         skip_ai_on_prefilter_fail=True,
         max_stop_loss_pct=settings.max_stop_loss_pct,
         max_ema_extension_atr=settings.max_ema_extension_atr,
+        allow_fractional_shares=settings.allow_fractional_shares,
     )
 
 

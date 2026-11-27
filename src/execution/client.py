@@ -232,7 +232,23 @@ class AlpacaExecutionClient:
             else _generate_client_order_id("buy", normalized_symbol)
         )
 
-        if take_profit_price is not None:
+        is_fractional = abs(float(qty) - round(float(qty))) > 1e-6
+        if is_fractional:
+            rounded_tp = (
+                round(take_profit_price, 2)
+                if take_profit_price is not None and round(take_profit_price, 2) > limit_price
+                else None
+            )
+            order_class = OrderClass.SIMPLE
+            order_request = LimitOrderRequest(
+                symbol=normalized_symbol,
+                qty=round(float(qty), 4),
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+                client_order_id=resolved_client_id,
+            )
+        elif take_profit_price is not None:
             rounded_tp = round(take_profit_price, 2)
             if rounded_tp <= limit_price:
                 raise ValueError(
@@ -1036,8 +1052,10 @@ class AlpacaExecutionClient:
                 else entry_price
             )
             stop_order_id = broker_stop_id or (stored.stop_order_id if stored is not None else None)
+            is_fractional_pos = abs(float(qty) - round(float(qty))) > 1e-6
             if (
                 ensure_protective_stops
+                and not is_fractional_pos
                 and broker_stop_id is None
                 and symbol not in bracket_protected_symbols
                 and current_stop > 0.0
