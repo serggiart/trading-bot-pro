@@ -1,6 +1,21 @@
 {
-  "_comment": "Micro-Capital Fractional Growth Template (~$10,000 MXN / ~$500 USD). Enables fractional shares across all 23 walk-forward calibrated leaders with 45% single-asset cap and 2.0% risk per trade.",
+  "_comment": "Elite 13-Leader Fractional Compounding Profile (~$10,000 MXN / ~$500 USD). Concentrates $500 USD via fractional shares across the top 13 walk-forward wave leaders with 45% single-asset cap, 2.0% risk per trade, and 0.45 Kelly.",
   "tickers": [
+    "AAPL",
+    "PLTR",
+    "SHOP",
+    "ADBE",
+    "GOOGL",
+    "META",
+    "NKE",
+    "SBUX",
+    "WMT",
+    "JNJ",
+    "ABBV",
+    "UBER",
+    "V"
+  ],
+  "master_tickers": [
     "AAPL",
     "NVDA",
     "AMD",
@@ -46,6 +61,7 @@
   "max_sector_exposure_pct": 0.50,
   "kelly_fraction": 0.45,
   "allow_fractional_shares": true,
+  "max_capital_budget": 500.0,
   "confirmation_delay_minutes": 2.0,
   "max_confirmation_delay_minutes": 5.0,
   "default_sector": "Technology",

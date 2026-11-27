@@ -27,6 +27,7 @@ class BacktestConfig:
     peak_activation_pct: float = 0.0
     peak_rsi_threshold: float = 66.0
     allow_fractional_shares: bool = False
+    monthly_contribution: float = 0.0
     cache_dir: Path = Path("data/candles")
 
     def __post_init__(self) -> None:
@@ -56,6 +57,8 @@ class BacktestConfig:
             raise ValueError("peak_activation_pct must be in [0.0, 1.0)")
         if not 0.0 < self.peak_rsi_threshold <= 100.0:
             raise ValueError("peak_rsi_threshold must be in (0.0, 100.0]")
+        if self.monthly_contribution < 0.0:
+            raise ValueError("monthly_contribution must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +100,7 @@ class BacktestMetrics:
     expectancy_per_trade: float
     avg_win: float
     avg_loss: float
+    total_contributed: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

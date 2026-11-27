@@ -142,8 +142,13 @@ class StrategySelfCalibrator:
             for s in (candidate_tickers if candidate_tickers is not None else settings.tickers)
             if s.strip() and s.strip().upper() in market_data
         ]
+        cal_capital = (
+            settings.max_capital_budget
+            if settings.max_capital_budget > 0.0
+            else 10_000.0
+        )
         base_cfg = BacktestConfig(
-            initial_capital=10_000.0,
+            initial_capital=cal_capital,
             atr_stop_multiplier=settings.atr_stop_multiplier,
             atr_take_profit_multiplier=settings.atr_take_profit_multiplier,
             max_hold_bars=settings.max_hold_bars,
@@ -154,6 +159,7 @@ class StrategySelfCalibrator:
             breakeven_trigger_pct=settings.breakeven_trigger_pct or 0.06,
             peak_activation_pct=settings.peak_activation_pct or 0.06,
             peak_rsi_threshold=settings.peak_rsi_threshold or 68.0,
+            allow_fractional_shares=settings.allow_fractional_shares,
         )
 
         scores: list[TickerCalibrationScore] = []
@@ -173,18 +179,33 @@ class StrategySelfCalibrator:
             total_combined_trades = m.total_trades + live_trades
             should_prune = (
                 total_combined_trades >= self.min_trades_for_pruning
-                and effective_pf < self.min_ticker_profit_factor
+                and (
+                    effective_pf < self.min_ticker_profit_factor
+                    or m.total_return_pct < 0.0
+                )
             )
             live_tag = (
                 f", live={live_trades} trades ({live_pnl:+.2f} USD)"
                 if live_trades > 0
                 else ""
             )
-            reason = (
-                f"Pruned: effective PF {effective_pf:.2f} < {self.min_ticker_profit_factor:.2f} across {total_combined_trades} trades{live_tag}"
-                if should_prune
-                else f"Active: effective PF {effective_pf:.2f} ({m.total_trades} bt trades, {m.total_return_pct:+.2%}{live_tag})"
-            )
+            if should_prune:
+                if effective_pf < self.min_ticker_profit_factor:
+                    reason = (
+                        f"Pruned: effective PF {effective_pf:.2f} < "
+                        f"{self.min_ticker_profit_factor:.2f} across "
+                        f"{total_combined_trades} trades{live_tag}"
+                    )
+                else:
+                    reason = (
+                        f"Pruned: negative standalone return {m.total_return_pct:+.2%} "
+                        f"across {total_combined_trades} trades{live_tag}"
+                    )
+            else:
+                reason = (
+                    f"Active: effective PF {effective_pf:.2f} ({m.total_trades} bt trades, "
+                    f"{m.total_return_pct:+.2%}{live_tag})"
+                )
             scores.append(
                 TickerCalibrationScore(
                     symbol=sym,
@@ -232,8 +253,13 @@ class StrategySelfCalibrator:
         current_md = {sym: market_data[sym] for sym in current_symbols}
         current_corr = compute_return_correlation_matrix(current_md)
 
+        cal_capital = (
+            settings.max_capital_budget
+            if settings.max_capital_budget > 0.0
+            else 10_000.0
+        )
         baseline_cfg = BacktestConfig(
-            initial_capital=10_000.0,
+            initial_capital=cal_capital,
             atr_stop_multiplier=settings.atr_stop_multiplier,
             atr_take_profit_multiplier=settings.atr_take_profit_multiplier,
             max_hold_bars=settings.max_hold_bars,
@@ -244,6 +270,7 @@ class StrategySelfCalibrator:
             breakeven_trigger_pct=settings.breakeven_trigger_pct,
             peak_activation_pct=settings.peak_activation_pct,
             peak_rsi_threshold=settings.peak_rsi_threshold,
+            allow_fractional_shares=settings.allow_fractional_shares,
         )
         baseline_metrics = (
             BacktestEngine(guardian=_guardian_for_settings(settings), config=baseline_cfg)
@@ -311,9 +338,14 @@ class StrategySelfCalibrator:
         best_active = tuple(current_symbols)
         best_pruned: tuple[str, ...] = ()
 
+        effective_max_dd = (
+            max(self.max_allowed_drawdown_pct, 0.09)
+            if settings.allow_fractional_shares
+            else self.max_allowed_drawdown_pct
+        )
         for candidate in grid:
             cfg = BacktestConfig(
-                initial_capital=10_000.0,
+                initial_capital=cal_capital,
                 atr_stop_multiplier=settings.atr_stop_multiplier,
                 atr_take_profit_multiplier=settings.atr_take_profit_multiplier,
                 max_hold_bars=settings.max_hold_bars,
@@ -324,6 +356,7 @@ class StrategySelfCalibrator:
                 breakeven_trigger_pct=float(candidate["breakeven_trigger_pct"]),
                 peak_activation_pct=float(candidate["peak_activation_pct"]),
                 peak_rsi_threshold=float(candidate["peak_rsi_threshold"]),
+                allow_fractional_shares=settings.allow_fractional_shares,
             )
             metrics = (
                 BacktestEngine(guardian=_guardian_for_settings(settings), config=cfg)
@@ -337,7 +370,7 @@ class StrategySelfCalibrator:
             )
             score = compute_objective_score(metrics)
             if (
-                metrics.max_drawdown_pct <= self.max_allowed_drawdown_pct
+                metrics.max_drawdown_pct <= effective_max_dd
                 and score > best_score
             ):
                 best_score = score

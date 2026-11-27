@@ -122,13 +122,28 @@ def normalize_ny_datetime(now: datetime | None = None) -> datetime:
     return now.astimezone(NY_TIMEZONE)
 
 
+def get_market_close_time(day: date) -> time:
+    """Return regular 16:00 ET close or 13:00 ET on NYSE scheduled early-close days."""
+    nov_first = date(day.year, 11, 1)
+    days_to_thu = (3 - nov_first.weekday()) % 7
+    thanksgiving = nov_first + timedelta(days=days_to_thu + 21)
+    black_friday = thanksgiving + timedelta(days=1)
+    if day == black_friday:
+        return time(13, 0)
+    if day.month == 12 and day.day == 24 and day.weekday() < 5:
+        return time(13, 0)
+    if day.month == 7 and day.day == 3 and day.weekday() < 5:
+        return time(13, 0)
+    return MARKET_CLOSE_TIME
+
+
 def is_market_open(now: datetime | None = None) -> bool:
-    """Return True during regular US equity market hours (Mon-Fri 09:30 <= t < 16:00 ET)."""
+    """Return True during regular US equity market hours (09:30 ET to market close)."""
     ny_now = normalize_ny_datetime(now)
     if ny_now.weekday() >= 5:
         return False
     current_time = ny_now.time()
-    return MARKET_OPEN_TIME <= current_time < MARKET_CLOSE_TIME
+    return MARKET_OPEN_TIME <= current_time < get_market_close_time(ny_now.date())
 
 
 def estimate_intraday_run_rate_volume(
@@ -143,8 +158,12 @@ def estimate_intraday_run_rate_volume(
     if not is_market_open(ny_now):
         return float(latest_volume)
     market_open_dt = datetime.combine(ny_now.date(), MARKET_OPEN_TIME, tzinfo=NY_TIMEZONE)
+    market_close_dt = datetime.combine(
+        ny_now.date(), get_market_close_time(ny_now.date()), tzinfo=NY_TIMEZONE
+    )
+    session_minutes = max((market_close_dt - market_open_dt).total_seconds() / 60.0, 1.0)
     elapsed_minutes = (ny_now - market_open_dt).total_seconds() / 60.0
-    session_fraction = max(elapsed_minutes / 390.0, min_session_fraction)
+    session_fraction = max(elapsed_minutes / session_minutes, min_session_fraction)
     return float(latest_volume) / min(session_fraction, 1.0)
 
 
@@ -263,6 +282,7 @@ class TradingBotOrchestrator:
         max_stop_loss_pct: float = 0.0,
         max_ema_extension_atr: float = 0.0,
         allow_fractional_shares: bool = False,
+        max_capital_budget: float = 0.0,
     ) -> None:
         self.audit_store = audit_store or TradingAuditStore()
         self.guardian = guardian or RiskGuardian()
@@ -288,6 +308,7 @@ class TradingBotOrchestrator:
         self.max_stop_loss_pct = float(max_stop_loss_pct)
         self.max_ema_extension_atr = float(max_ema_extension_atr)
         self.allow_fractional_shares = bool(allow_fractional_shares)
+        self.max_capital_budget = float(max_capital_budget)
         self.stop_reentry_cooldown_hours: float = 24.0
         self._stop_loss_cooldowns: dict[str, datetime] = {}
         self.ai_cache_ttl_minutes: float = 60.0
@@ -893,6 +914,21 @@ class TradingBotOrchestrator:
                 ]
             elif snapshot is not None:
                 resolved_positions = []
+
+        if self.max_capital_budget > 0.0:
+            budget = self.max_capital_budget
+            broker_equity = resolved_equity
+            open_cost = sum(pos.shares * pos.avg_price for pos in resolved_positions)
+            budget_cash = max(0.0, budget - open_cost)
+            available_cash = (
+                min(available_cash, budget_cash)
+                if available_cash is not None
+                else budget_cash
+            )
+            if broker_equity > budget:
+                if open_cost > budget * 1.15 or abs(resolved_pnl) > budget * 0.25:
+                    resolved_pnl = resolved_pnl * (budget / broker_equity)
+                resolved_equity = budget
 
         return resolved_equity, resolved_pnl, resolved_positions, available_cash
 
@@ -1516,6 +1552,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Initial capital for --backtest mode (default: 10000.0)",
     )
     parser.add_argument(
+        "--monthly-contribution",
+        type=float,
+        default=0.0,
+        help="Recurring monthly deposit (USD) added every 21 trading bars in --backtest mode (default: 0.0)",
+    )
+    parser.add_argument(
         "--max-candidates",
         type=int,
         default=None,
@@ -1558,6 +1600,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--interval-seconds must be strictly positive")
     if args.initial_capital <= 0:
         parser.error("--initial-capital must be strictly positive")
+    if args.monthly_contribution < 0:
+        parser.error("--monthly-contribution must be non-negative")
     if args.max_candidates is not None and args.max_candidates <= 0:
         parser.error("--max-candidates must be strictly positive")
     return args
@@ -1606,6 +1650,8 @@ def _run_backtest_cli(
         bt_kwargs["peak_rsi_threshold"] = settings.peak_rsi_threshold
     if settings.allow_fractional_shares:
         bt_kwargs["allow_fractional_shares"] = True
+    if args.monthly_contribution > 0.0:
+        bt_kwargs["monthly_contribution"] = args.monthly_contribution
     config = BacktestConfig(**bt_kwargs)
     resolved_guardian = guardian
     if resolved_guardian is None:
@@ -1637,6 +1683,11 @@ def _run_backtest_cli(
     )
     metrics = report.metrics
 
+    invested_line = (
+        f"Total Invested : ${metrics.total_contributed:,.2f}\n"
+        if args.monthly_contribution > 0.0
+        else ""
+    )
     summary = (
         "\n=== Backtest Summary ===\n"
         f"Tickers       : {', '.join(symbols)}\n"
@@ -1647,6 +1698,7 @@ def _run_backtest_cli(
         f"Max Drawdown  : {metrics.max_drawdown_pct:.2%}\n"
         f"Total Return  : {metrics.total_return_pct:.2%}\n"
         f"Initial Capital: ${metrics.initial_capital:,.2f}\n"
+        f"{invested_line}"
         f"Final Equity  : ${metrics.final_equity:,.2f}\n"
         f"Compounded PnL: ${metrics.compounded_pnl:,.2f}\n"
         f"Guardian Vetoes: {report.vetoed_entries_count}\n"
@@ -1724,6 +1776,7 @@ def _build_orchestrator_from_settings(
         max_stop_loss_pct=settings.max_stop_loss_pct,
         max_ema_extension_atr=settings.max_ema_extension_atr,
         allow_fractional_shares=settings.allow_fractional_shares,
+        max_capital_budget=settings.max_capital_budget,
     )
 
 

@@ -89,6 +89,7 @@ def compute_backtest_metrics(
     trades: Sequence[SimulatedTrade],
     initial_capital: float,
     equity_curve: Sequence[tuple[str, float]],
+    total_contributed: float | None = None,
 ) -> BacktestMetrics:
     """Compute aggregate performance metrics safely for 0-trade and 0-loss edge cases."""
     total_trades = len(trades)
@@ -115,14 +116,19 @@ def compute_backtest_metrics(
     total_trade_pnl = sum(t.pnl for t in trades)
     expectancy_per_trade = (total_trade_pnl / total_trades) if total_trades > 0 else 0.0
 
+    invested = (
+        float(total_contributed)
+        if total_contributed is not None and total_contributed > 0.0
+        else float(initial_capital)
+    )
     final_equity = (
         float(equity_curve[-1][1])
         if equity_curve
-        else float(initial_capital) + total_trade_pnl
+        else invested + total_trade_pnl
     )
-    compounded_pnl = final_equity - float(initial_capital)
+    compounded_pnl = final_equity - invested
     total_return_pct = (
-        (compounded_pnl / float(initial_capital)) if initial_capital > 0.0 else 0.0
+        (compounded_pnl / invested) if invested > 0.0 else 0.0
     )
 
     max_drawdown_pct = 0.0
@@ -151,6 +157,7 @@ def compute_backtest_metrics(
         expectancy_per_trade=expectancy_per_trade,
         avg_win=avg_win,
         avg_loss=avg_loss,
+        total_contributed=invested,
     )
 
 
@@ -351,6 +358,8 @@ class BacktestEngine:
 
         cash = float(self.config.initial_capital)
         prev_equity = float(self.config.initial_capital)
+        total_contributed = float(self.config.initial_capital)
+        trading_bars_elapsed = 0
         open_positions: dict[str, _OpenPosition] = {}
         last_known_close: dict[str, float] = {}
         trades: list[SimulatedTrade] = []
@@ -366,6 +375,16 @@ class BacktestEngine:
 
             if global_idx < warmup:
                 continue
+
+            trading_bars_elapsed += 1
+            if (
+                self.config.monthly_contribution > 0.0
+                and trading_bars_elapsed > 1
+                and (trading_bars_elapsed - 1) % 21 == 0
+            ):
+                cash += self.config.monthly_contribution
+                prev_equity += self.config.monthly_contribution
+                total_contributed += self.config.monthly_contribution
 
             date_str = _format_bar_date(bar_ts)
             bar_dt = _to_ny_datetime(bar_ts)
@@ -658,6 +677,7 @@ class BacktestEngine:
             trades=trades,
             initial_capital=self.config.initial_capital,
             equity_curve=equity_curve,
+            total_contributed=total_contributed,
         )
         return BacktestReport(
             config=self.config,

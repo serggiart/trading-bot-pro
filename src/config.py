@@ -41,6 +41,7 @@ class StrategySettings:
     max_sector_exposure_pct: float = 0.35
     kelly_fraction: float = 0.25
     allow_fractional_shares: bool = False
+    max_capital_budget: float = 0.0
     confirmation_delay_minutes: float = 2.0
     max_confirmation_delay_minutes: float = 5.0
     default_sector: str = "Technology"
@@ -85,6 +86,8 @@ class StrategySettings:
             raise ValueError("max_sector_exposure_pct must be in (0, 1]")
         if not 0.0 < self.kelly_fraction <= 1.0:
             raise ValueError("kelly_fraction must be in (0, 1]")
+        if self.max_capital_budget < 0.0:
+            raise ValueError("max_capital_budget must be non-negative")
         if self.confirmation_delay_minutes < 0.0:
             raise ValueError("confirmation_delay_minutes must be non-negative")
         if self.max_confirmation_delay_minutes < self.confirmation_delay_minutes:
@@ -192,6 +195,9 @@ def load_strategy_settings(
         ),
         allow_fractional_shares=bool(
             raw_data.get("allow_fractional_shares", defaults.allow_fractional_shares)
+        ),
+        max_capital_budget=float(
+            raw_data.get("max_capital_budget", defaults.max_capital_budget)
         ),
         confirmation_delay_minutes=float(
             raw_data.get("confirmation_delay_minutes", defaults.confirmation_delay_minutes)

@@ -898,3 +898,117 @@ def test_fractional_backtest_unlocks_500_usd_account() -> None:
     assert whole_rep.metrics.total_trades == 0
     assert frac_rep.metrics.total_trades >= 1
     assert any(abs(t.shares - round(t.shares)) > 1e-6 for t in frac_rep.trades)
+
+
+def test_max_capital_budget_caps_100k_broker_account_to_500_usd(tmp_path: Path) -> None:
+    store = TradingAuditStore(tmp_path / "budget_cap.db")
+    mock_exec = MagicMock()
+    bot = TradingBotOrchestrator(
+        execution_client=mock_exec,
+        audit_store=store,
+        allow_fractional_shares=True,
+        max_capital_budget=500.0,
+    )
+
+    # Case 1: $100k broker account with $0 open positions
+    mock_exec.get_account_snapshot.return_value = SimpleNamespace(
+        last_equity=100_000.0,
+        equity=100_000.0,
+        daily_pnl=0.0,
+        cash=100_000.0,
+    )
+    mock_exec.get_open_positions.return_value = []
+    eq, pnl, positions, cash = bot._sync_broker_account_state(100_000.0, 0.0, ())
+    assert eq == pytest.approx(500.0)
+    assert cash == pytest.approx(500.0)
+    assert pnl == pytest.approx(0.0)
+    assert positions == []
+
+    # Case 2: $225 fractional open position + -$12 realistic daily PnL
+    mock_exec.get_account_snapshot.return_value = SimpleNamespace(
+        last_equity=100_000.0,
+        equity=99_988.0,
+        daily_pnl=-12.0,
+        cash=99_775.0,
+    )
+    mock_exec.get_open_positions.return_value = [
+        SimpleNamespace(
+            symbol="V",
+            sector="Financials",
+            market_value=213.0,
+            shares=0.5,
+            avg_price=450.0,
+        )
+    ]
+    eq, pnl, positions, cash = bot._sync_broker_account_state(100_000.0, 0.0, ())
+    assert eq == pytest.approx(500.0)
+    assert cash == pytest.approx(275.0)
+    assert pnl == pytest.approx(-12.0)
+    assert len(positions) == 1
+
+    # Case 3: Legacy $95,000 open positions + -$1,500 daily PnL -> cash blocked at $0 and PnL scaled
+    mock_exec.get_account_snapshot.return_value = SimpleNamespace(
+        last_equity=100_000.0,
+        equity=98_500.0,
+        daily_pnl=-1_500.0,
+        cash=5_000.0,
+    )
+    mock_exec.get_open_positions.return_value = [
+        SimpleNamespace(
+            symbol="AAPL",
+            sector="Technology",
+            market_value=93_500.0,
+            shares=200.0,
+            avg_price=475.0,
+        )
+    ]
+    eq, pnl, positions, cash = bot._sync_broker_account_state(100_000.0, 0.0, ())
+    assert eq == pytest.approx(500.0)
+    assert cash == pytest.approx(0.0)
+    assert pnl == pytest.approx(-7.50)
+    store.close()
+
+
+def test_backtest_monthly_contribution_dca_compounds_honestly() -> None:
+    import numpy as np
+    import pandas as pd
+    from src.backtest import BacktestConfig, BacktestEngine
+    from src.guardian import RiskGuardian
+
+    # 270 business days: 200 warmup + 70 active bars -> injections at bar 22, 43, 64 (3 * $100)
+    dates = pd.bdate_range("2025-01-02", periods=270)
+    flat = np.full(len(dates), 100.0)
+    df = pd.DataFrame(
+        {
+            "Open": flat,
+            "High": flat,
+            "Low": flat,
+            "Close": flat,
+            "Volume": np.full(len(dates), 1_000_000.0),
+        },
+        index=dates,
+    )
+    report = BacktestEngine(
+        guardian=RiskGuardian(),
+        config=BacktestConfig(
+            initial_capital=500.0,
+            monthly_contribution=100.0,
+            allow_fractional_shares=True,
+        ),
+    ).run({"AAPL": df}, sector_map={"AAPL": "Technology"})
+
+    m = report.metrics
+    assert m.total_trades == 0
+    assert m.total_contributed > 500.0
+    assert m.total_contributed == pytest.approx(800.0)
+    assert m.final_equity == pytest.approx(800.0)
+    assert m.compounded_pnl == pytest.approx(0.0)
+    assert m.total_return_pct == pytest.approx(0.0)
+
+
+def test_is_market_open_handles_black_friday_early_close() -> None:
+    from main import is_market_open
+
+    assert is_market_open(datetime(2026, 11, 27, 12, 59, tzinfo=NY_TIMEZONE)) is True
+    assert is_market_open(datetime(2026, 11, 27, 13, 0, tzinfo=NY_TIMEZONE)) is False
+    assert is_market_open(datetime(2026, 11, 20, 15, 30, tzinfo=NY_TIMEZONE)) is True
